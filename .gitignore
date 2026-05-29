@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+venv/
+.env
+.venv/
+
+# Streamlit
+.streamlit/
+
+# Temp / Cache
+temp/
+*.tmp
+*.mp4
+*.mov
+*.avi
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Model weights (too large for git)
+*.pt
+
+# Test results
+test_result.json
