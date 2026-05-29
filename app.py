@@ -1,6 +1,6 @@
 """
 Fencing Analyzer — Streamlit App
-Interaktives Dashboard für Fecht-Video-Analyse mit YOLOv8m-Pose
+Fecht-Video-Analyse mit YOLOv8m-Pose + Interaktivem Live-Video-Player
 
 Usage:
   streamlit run C:\\Users\\micha\\Desktop\\fencing_analyzer\\app.py
@@ -8,17 +8,17 @@ Usage:
 import streamlit as st
 st.set_page_config(page_title="Fecht-Analyzer", layout="wide", page_icon="\U0001F93A")
 
-import os, sys, json, math, time, shutil, subprocess, tempfile
+import os, sys, json, math, time, shutil, subprocess, tempfile, struct, base64, socket, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 import cv2
 from PIL import Image
 from ultralytics import YOLO
+from streamlit.components.v1 import html as st_html
 
 # --- CONSTS ---
 C_GREEN  = "#00ff88"
@@ -34,12 +34,126 @@ C_ACCENT = "#58a6ff"
 PISTE_WIDTH_CM = 200
 PISTE_WIDTH_PX_FALLBACK = 130
 
-COCO_KP_NAMES = {
-    0:"Nase",1:"Auge L",2:"Auge R",3:"Ohr L",4:"Ohr R",
-    5:"Schulter L",6:"Schulter R",7:"Ellbogen L",8:"Ellbogen R",
-    9:"Handgelenk L",10:"Handgelenk R",11:"Huefte L",12:"Huefte R",
-    13:"Knie L",14:"Knie R",15:"Knoechel L",16:"Knoechel R"
-}
+# --- MINI HTTP SERVER für Large-Video-Support ---
+_media_server = None
+_media_server_port = None
+
+class MediaRequestHandler(BaseHTTPRequestHandler):
+    """Serves video file with range support + JSON data for the live player."""
+    video_path = None
+    frame_data_json = None
+    metrics_json = None
+    
+    def do_GET(self):
+        if self.path == "/video":
+            self._serve_video()
+        elif self.path == "/data.json":
+            self._serve_json(MediaRequestHandler.frame_data_json, "application/json")
+        elif self.path == "/metrics.json":
+            self._serve_json(MediaRequestHandler.metrics_json, "application/json")
+        elif self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def _serve_video(self):
+        path = MediaRequestHandler.video_path
+        if not path or not path.exists():
+            self.send_response(404)
+            self.end_headers()
+            return
+        file_size = path.stat().st_size
+        range_header = self.headers.get("Range", "")
+        
+        if range_header.startswith("bytes="):
+            start, end = 0, file_size - 1
+            parts = range_header[6:].split("-")
+            if parts[0]:
+                start = int(parts[0])
+            if parts[1]:
+                end = int(parts[1])
+            content_length = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Accept-Ranges", "bytes")
+        else:
+            start, end = 0, file_size - 1
+            content_length = file_size
+            self.send_response(200)
+            self.send_header("Accept-Ranges", "bytes")
+        
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+    
+    def _serve_json(self, data, mime):
+        if data is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        data_bytes = data.encode("utf-8") if isinstance(data, str) else data
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "max-age=3600")
+        self.end_headers()
+        self.wfile.write(data_bytes)
+    
+    def log_message(self, format, *args):
+        pass  # suppress HTTP server logs
+
+def start_media_server(video_path, frame_data, metrics):
+    """Startet Mini-HTTP-Server auf einem freien Port, gibt die URL zurück."""
+    global _media_server, _media_server_port
+    
+    # Stop old server
+    stop_media_server()
+    
+    MediaRequestHandler.video_path = Path(video_path)
+    MediaRequestHandler.frame_data_json = json.dumps(frame_data)
+    MediaRequestHandler.metrics_json = json.dumps(metrics)
+    
+    # Find free port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    _media_server_port = sock.getsockname()[1]
+    sock.close()
+    
+    server = HTTPServer(("127.0.0.1", _media_server_port), MediaRequestHandler)
+    _media_server = server
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{_media_server_port}"
+
+def stop_media_server():
+    global _media_server
+    if _media_server:
+        _media_server.shutdown()
+        _media_server = None
+
+# COCO Pose skeleton connections (17 keypoints)
+COCO_SKELETON = [
+    (0,1),(0,2),(1,3),(2,4),       # face
+    (5,6),(5,7),(7,9),(6,8),(8,10), # arms
+    (5,11),(6,12),(11,12),          # torso
+    (11,13),(13,15),(12,14),(14,16) # legs
+]
 
 def kpt(kpts, idx):
     if kpts is None or idx >= len(kpts): return None
@@ -60,20 +174,8 @@ def angle_at(p1, p2, p3):
     if n1 < 1 or n2 < 1: return None
     return math.degrees(math.acos(max(-1, min(1, (v1[0]*v2[0]+v1[1]*v2[1])/(n1*n2)))))
 
-def fig_theme(fig, title="", xlabel="", ylabel=""):
-    fig.update_layout(
-        title=dict(text=title, font=dict(size=14, color=C_TEXT), x=0.02),
-        paper_bgcolor=C_CARD, plot_bgcolor=C_CARD,
-        font=dict(color=C_TEXT, size=11),
-        xaxis=dict(gridcolor="#21262d", title=xlabel, color=C_MUTED, showline=True, linecolor=C_BORDER),
-        yaxis=dict(gridcolor="#21262d", title=ylabel, color=C_MUTED, showline=True, linecolor=C_BORDER),
-        margin=dict(l=40, r=16, t=32, b=32),
-        hovermode="x unified",
-        legend=dict(bgcolor="rgba(0,0,0,0.6)", bordercolor=C_BORDER),
-    )
-    return fig
 
-# --- ANALYSIS ENGINE ---
+# === ANALYSIS ENGINE ===
 @st.cache_resource
 def load_model():
     return YOLO("yolov8m-pose.pt")
@@ -87,27 +189,26 @@ def extract_clip(video_path, output_path, start_sec=0, duration_sec=15, target_w
         "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an",
         "-y", str(output_path)
     ]
-    subprocess.run(cmd, capture_output=True, timeout=300)
+    subprocess.run(cmd, capture_output=True, timeout=600)
     return output_path.exists()
 
 def analyze_video(video_path, progress_callback=None):
+    """Returns result dict with frames (keypoints per frame), metrics, summary."""
     model = load_model()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError("Video konnte nicht geoeffnet werden")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     ret, first_frame = cap.read()
-    if ret:
-        h_frame, w_frame = first_frame.shape[:2]
-    else:
-        w_frame, h_frame = 640, 360
+    w_frame = first_frame.shape[1] if ret else 640
+    h_frame = first_frame.shape[0] if ret else 360
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps
 
     TRACK_IDS = [0, 1]
     prev_centers = {}
-    all_frames = []
+    frame_data = []  # compact: [time, m_kpts_xy, g_kpts_xy]
     frame_idx = 0
 
     while cap.isOpened():
@@ -155,160 +256,172 @@ def analyze_video(video_path, progress_callback=None):
         m_kpts = get_kpts(0)
         g_kpts = get_kpts(1)
 
-        rec = {"frame": frame_idx, "time": frame_idx/fps}
-        for label, kpts_obj in [("m", m_kpts), ("g", g_kpts)]:
-            d = {}
-            for idx in range(17):
-                d[COCO_KP_NAMES[idx]] = kpt(kpts_obj, idx)
-            d["nose"] = kpt(kpts_obj, 0)
-            d["shoulder_l"] = kpt(kpts_obj, 5); d["shoulder_r"] = kpt(kpts_obj, 6)
-            d["elbow_l"] = kpt(kpts_obj, 7); d["elbow_r"] = kpt(kpts_obj, 8)
-            d["wrist_l"] = kpt(kpts_obj, 9); d["wrist_r"] = kpt(kpts_obj, 10)
-            d["hip_l"] = kpt(kpts_obj, 11); d["hip_r"] = kpt(kpts_obj, 12)
-            d["knee_l"] = kpt(kpts_obj, 13); d["knee_r"] = kpt(kpts_obj, 14)
-            d["ankle_l"] = kpt(kpts_obj, 15); d["ankle_r"] = kpt(kpts_obj, 16)
-            d["hip_mid"] = midpoint(d["hip_l"], d["hip_r"])
-            d["shoulder_mid"] = midpoint(d["shoulder_l"], d["shoulder_r"])
-            rec[label] = d
+        # Compact: flatten keypoints to [x,y] * 17
+        def flatten_kpts(kpts_obj):
+            if kpts_obj is None:
+                return None
+            flat = []
+            for i in range(17):
+                x, y = float(kpts_obj[i][0]), float(kpts_obj[i][1])
+                if x > 0 and y > 0:
+                    flat.extend([round(x), round(y)])
+                else:
+                    flat.extend([0, 0])
+            return flat
 
-        all_frames.append(rec)
+        frame_data.append({
+            "t": round(frame_idx / fps, 2),
+            "m": flatten_kpts(m_kpts),
+            "g": flatten_kpts(g_kpts),
+        })
+
         frame_idx += 1
         if progress_callback and frame_idx % 15 == 0:
             progress_callback(frame_idx / total_frames)
 
     cap.release()
-    N = len(all_frames)
+    N = len(frame_data)
 
     # Kalibrierung
     all_hip_x = []
-    for f in all_frames:
+    for f in frame_data:
         for label in ("m", "g"):
-            if f[label]["hip_mid"]:
-                all_hip_x.append(f[label]["hip_mid"][0])
+            k = f[label]
+            if k:
+                hip_x = k[22]  # index 11*2 = 22 (hip_l x)
+                if hip_x > 0:
+                    all_hip_x.append(hip_x)
     piste_px = (max(all_hip_x) - min(all_hip_x)) if all_hip_x else PISTE_WIDTH_PX_FALLBACK
     px_per_cm = piste_px / PISTE_WIDTH_CM
 
-    # === METRIK 1: DISTANZ ===
-    m1_dist = []
-    for f in all_frames:
-        d_val = dist(f["m"]["hip_mid"], f["g"]["hip_mid"])
+    # Helper: get keypoint from flat [x,y]*17
+    def get_kp(flat, idx):
+        if flat is None: return None
+        x, y = flat[idx*2], flat[idx*2+1]
+        return (x, y) if x > 0 and y > 0 else None
+
+    def get_mid(flat, idx1, idx2):
+        a, b = get_kp(flat, idx1), get_kp(flat, idx2)
+        return midpoint(a, b)
+
+    # Compute all metrics
+    m1_dist = []  # distance
+    m2_m_angle, m2_g_angle = [], []
+    m3_m_lunge, m3_g_lunge = [], []
+    m4_m_path, m4_g_path = [], []
+    m5_m_tilt, m5_g_tilt = [], []
+    m6_m_acc, m6_g_acc = [], []
+    m7_m_steps, m7_g_steps = [], []
+    m8_vel_m, m8_vel_g = [], []
+
+    for f in frame_data:
+        t = f["t"]
+        mk, gk = f["m"], f["g"]
+
+        # M1: Distance
+        m_hip = get_mid(mk, 11, 12)
+        g_hip = get_mid(gk, 11, 12)
+        d_val = dist(m_hip, g_hip)
         if d_val:
-            m1_dist.append({"t": f["time"], "px": d_val, "cm": d_val / px_per_cm})
+            m1_dist.append({"t": t, "px": d_val, "cm": d_val / px_per_cm})
 
-    # === METRIK 2: WAFFENARM-WINKEL ===
-    m2_m_angle = []
-    m2_g_angle = []
-    for f in all_frames:
-        a = angle_at(f["m"]["shoulder_r"], f["m"]["elbow_r"], f["m"]["wrist_r"])
-        if a is None: a = angle_at(f["m"]["shoulder_l"], f["m"]["elbow_l"], f["m"]["wrist_l"])
-        m2_m_angle.append({"t": f["time"], "deg": a or 0})
-        b = angle_at(f["g"]["shoulder_l"], f["g"]["elbow_l"], f["g"]["wrist_l"])
-        if b is None: b = angle_at(f["g"]["shoulder_r"], f["g"]["elbow_r"], f["g"]["wrist_r"])
-        m2_g_angle.append({"t": f["time"], "deg": b or 0})
+        # M2: Weapon arm angle
+        a1 = angle_at(get_kp(mk, 6), get_kp(mk, 8), get_kp(mk, 10))  # R shoulder->elbow->wrist
+        if a1 is None: a1 = angle_at(get_kp(mk, 5), get_kp(mk, 7), get_kp(mk, 9))
+        m2_m_angle.append({"t": t, "deg": a1 or 0})
+        b1 = angle_at(get_kp(gk, 5), get_kp(gk, 7), get_kp(gk, 9))  # L shoulder->elbow->wrist
+        if b1 is None: b1 = angle_at(get_kp(gk, 6), get_kp(gk, 8), get_kp(gk, 10))
+        m2_g_angle.append({"t": t, "deg": b1 or 0})
 
-    # === METRIK 3: LUNGE-TIEFE ===
-    m3_m_lunge = []
-    m3_g_lunge = []
-    for f in all_frames:
-        m_hip = f["m"]["hip_mid"]
-        m_la, m_ra = f["m"]["ankle_l"], f["m"]["ankle_r"]
-        if m_hip and m_la and m_ra:
-            front = m_la if m_la[1] < m_ra[1] else m_ra
-            m3_m_lunge.append({"t": f["time"], "px": max(0, m_hip[1] - front[1])})
-        g_hip = f["g"]["hip_mid"]
-        g_la, g_ra = f["g"]["ankle_l"], f["g"]["ankle_r"]
-        if g_hip and g_la and g_ra:
-            front = g_la if g_la[1] < g_ra[1] else g_ra
-            m3_g_lunge.append({"t": f["time"], "px": max(0, g_hip[1] - front[1])})
+        # M3: Lunge depth
+        if m_hip and get_kp(mk, 15) and get_kp(mk, 16):
+            la, ra = get_kp(mk, 15), get_kp(mk, 16)
+            front = la if la[1] < ra[1] else ra
+            m3_m_lunge.append({"t": t, "px": max(0, m_hip[1] - front[1])})
+        if g_hip and get_kp(gk, 15) and get_kp(gk, 16):
+            la, ra = get_kp(gk, 15), get_kp(gk, 16)
+            front = la if la[1] < ra[1] else ra
+            m3_g_lunge.append({"t": t, "px": max(0, g_hip[1] - front[1])})
 
-    # === METRIK 4: BEWEGUNGS-PFAD ===
-    m4_m_path = [{"t": f["time"], "x": f["m"]["hip_mid"][0], "y": f["m"]["hip_mid"][1]}
-                 for f in all_frames if f["m"]["hip_mid"]]
-    m4_g_path = [{"t": f["time"], "x": f["g"]["hip_mid"][0], "y": f["g"]["hip_mid"][1]}
-                 for f in all_frames if f["g"]["hip_mid"]]
+        # M4: Movement path
+        if m_hip: m4_m_path.append({"t": t, "x": m_hip[0], "y": m_hip[1]})
+        if g_hip: m4_g_path.append({"t": t, "x": g_hip[0], "y": g_hip[1]})
 
-    # === METRIK 5: KOERPERHALTUNG ===
-    m5_m_tilt = []
-    m5_g_tilt = []
-    for f in all_frames:
-        ms = f["m"]["shoulder_mid"]; mh = f["m"]["hip_mid"]
-        if ms and mh:
-            dx, dy = ms[0]-mh[0], ms[1]-mh[1]
+        # M5: Torso tilt
+        m_sh = get_mid(mk, 5, 6)
+        if m_sh and m_hip:
+            dx = m_sh[0] - m_hip[0]; dy = m_sh[1] - m_hip[1]
             tilt = math.degrees(math.atan2(abs(dx), abs(dy))) if dy != 0 else 0
-            m5_m_tilt.append({"t": f["time"], "deg": tilt * (1 if dx > 0 else -1)})
-        gs = f["g"]["shoulder_mid"]; gh = f["g"]["hip_mid"]
-        if gs and gh:
-            dx, dy = gs[0]-gh[0], gs[1]-gh[1]
+            m5_m_tilt.append({"t": t, "deg": tilt * (1 if dx > 0 else -1)})
+        g_sh = get_mid(gk, 5, 6)
+        if g_sh and g_hip:
+            dx = g_sh[0] - g_hip[0]; dy = g_sh[1] - g_hip[1]
             tilt = math.degrees(math.atan2(abs(dx), abs(dy))) if dy != 0 else 0
-            m5_g_tilt.append({"t": f["time"], "deg": tilt * (1 if dx > 0 else -1)})
+            m5_g_tilt.append({"t": t, "deg": tilt * (1 if dx > 0 else -1)})
 
-    # === METRIK 6: BESCHLEUNIGUNG ===
-    m6_m_acc = []
-    m6_g_acc = []
+    # M6: Acceleration (needs 2-frame delta)
     for i in range(2, N):
         dt = 2/fps
-        def acc_3(label, wrist_key):
-            p0 = all_frames[i-2][label][wrist_key]
-            p1 = all_frames[i-1][label][wrist_key]
-            p2 = all_frames[i][label][wrist_key]
+        def wrist_acc(label, wrist_idx, alt_idx):
+            p0 = get_kp(frame_data[i-2][label], wrist_idx)
+            p1 = get_kp(frame_data[i-1][label], wrist_idx)
+            p2 = get_kp(frame_data[i][label], wrist_idx)
             if all([p0, p1, p2]):
                 v1 = dist(p0, p1) * fps if dist(p0, p1) else 0
                 v2 = dist(p1, p2) * fps if dist(p1, p2) else 0
                 return (v2 - v1) / dt
             return None
-        a_m = acc_3("m", "wrist_r")
-        if a_m is not None: m6_m_acc.append({"t": all_frames[i]["time"], "acc": a_m})
-        a_g = acc_3("g", "wrist_l")
-        if a_g is not None: m6_g_acc.append({"t": all_frames[i]["time"], "acc": a_g})
+        a_m = wrist_acc("m", 10, 9)
+        if a_m is not None: m6_m_acc.append({"t": frame_data[i]["t"], "acc": a_m})
+        a_g = wrist_acc("g", 9, 10)
+        if a_g is not None: m6_g_acc.append({"t": frame_data[i]["t"], "acc": a_g})
 
-    # === METRIK 7: SCHRITT-RHYTHMUS ===
-    def detect_steps(label):
-        steps = []
-        for i in range(1, N):
-            p = all_frames[i-1][label]; c = all_frames[i][label]
-            t = all_frames[i]["time"]
-            dl = dist(p["ankle_l"], c["ankle_l"]) or 0
-            dr = dist(p["ankle_r"], c["ankle_r"]) or 0
-            side = None
-            if dl > 12 and dr < 6:
-                side = "links"
-            elif dr > 12 and dl < 6:
-                side = "rechts"
-            if side:
-                other_recent = False
-                for j in range(max(0, i-3), i):
-                    pp = all_frames[j][label]
-                    op = all_frames[j+1][label]
-                    other_key = "ankle_r" if side == "links" else "ankle_l"
-                    o_d = dist(pp[other_key], op[other_key]) or 0
-                    if o_d > 12:
-                        other_recent = True
-                        break
-                if other_recent:
-                    step_type = "ganz"
-                else:
-                    step_type = "halb"
-                steps.append({"t": t, "side": side, "dist": dl if side == "links" else dr, "type": step_type})
-        return steps
+    # M7: Steps
+    for i in range(1, N):
+        p = frame_data[i-1]; c = frame_data[i]
+        for label in ("m", "g"):
+            p_la = get_kp(p[label], 15); p_ra = get_kp(p[label], 16)
+            c_la = get_kp(c[label], 15); c_ra = get_kp(c[label], 16)
+            if all([p_la, p_ra, c_la, c_ra]):
+                dl = dist(p_la, c_la) or 0
+                dr = dist(p_ra, c_ra) or 0
+                side = None
+                if dl > 12 and dr < 6:
+                    side = "links"
+                elif dr > 12 and dl < 6:
+                    side = "rechts"
+                if side:
+                    # Check if other foot moved recently
+                    other_moved = False
+                    for j in range(max(0, i-3), i):
+                        pp = frame_data[j][label]
+                        op = frame_data[j+1][label]
+                        other_key = 16 if side == "links" else 15
+                        pp_k = get_kp(pp, other_key); op_k = get_kp(op, other_key)
+                        if pp_k and op_k:
+                            if (dist(pp_k, op_k) or 0) > 12:
+                                other_moved = True
+                                break
+                    step_type = "ganz" if other_moved else "halb"
+                    step_rec = {"t": c["t"], "side": side, "dist": dl if side == "links" else dr, "type": step_type}
+                    if label == "m":
+                        m7_m_steps.append(step_rec)
+                    else:
+                        m7_g_steps.append(step_rec)
 
-    m7_m_steps = detect_steps("m")
-    m7_g_steps = detect_steps("g")
-
-    # === METRIK 8: SYNCHRONISIERUNG ===
-    m_vel = []
-    g_vel = []
+    # M8: Sync
     for i in range(1, len(m4_m_path)):
         dx = m4_m_path[i]["x"] - m4_m_path[i-1]["x"]
         dy = m4_m_path[i]["y"] - m4_m_path[i-1]["y"]
-        m_vel.append(math.hypot(dx, dy) * fps)
+        m8_vel_m.append(math.hypot(dx, dy) * fps)
     for i in range(1, len(m4_g_path)):
         dx = m4_g_path[i]["x"] - m4_g_path[i-1]["x"]
         dy = m4_g_path[i]["y"] - m4_g_path[i-1]["y"]
-        g_vel.append(math.hypot(dx, dy) * fps)
+        m8_vel_g.append(math.hypot(dx, dy) * fps)
 
-    min_vel = min(len(m_vel), len(g_vel))
-    mv = np.array(m_vel[:min_vel]) if m_vel else np.array([])
-    gv = np.array(g_vel[:min_vel]) if g_vel else np.array([])
+    min_vel = min(len(m8_vel_m), len(m8_vel_g))
+    mv = np.array(m8_vel_m[:min_vel]) if m8_vel_m else np.array([])
+    gv = np.array(m8_vel_g[:min_vel]) if m8_vel_g else np.array([])
 
     m8_corr = float(np.corrcoef(mv, gv)[0, 1]) if len(mv) > 10 and np.std(mv) > 0 and np.std(gv) > 0 else 0
     m8_lag = 0
@@ -316,21 +429,20 @@ def analyze_video(video_path, progress_callback=None):
         xcorr = np.correlate(mv - np.mean(mv), gv - np.mean(gv), mode='full')
         m8_lag = int(np.argmax(np.abs(xcorr)) - (len(mv) - 1))
 
-    # === METRIK 9: HEATMAP ===
-    m9_m_pos = [{"x": p["x"], "y": p["y"]} for p in m4_m_path]
-    m9_g_pos = [{"x": p["x"], "y": p["y"]} for p in m4_g_path]
-
     summary = {
-        "video": {"frames": N, "duration_s": round(duration, 1), "fps": fps, "resolution": f"{w_frame}x{h_frame}"},
+        "video": {"frames": N, "duration_s": round(duration, 1), "fps": fps, "resolution": f"{w_frame}x{h_frame}", "w": w_frame, "h": h_frame},
         "metrik_1_distanz": {
             "avg_px": round(float(np.mean([d["px"] for d in m1_dist])), 1) if m1_dist else 0,
             "min_px": round(float(np.min([d["px"] for d in m1_dist])), 1) if m1_dist else 0,
             "max_px": round(float(np.max([d["px"] for d in m1_dist])), 1) if m1_dist else 0,
             "avg_cm": round(float(np.mean([d["cm"] for d in m1_dist])), 1) if m1_dist else 0,
+            "data": [round(d["cm"], 1) for d in m1_dist],
         },
         "metrik_2_winkel": {
             "m_avg": round(float(np.mean([x["deg"] for x in m2_m_angle if x["deg"] > 0])), 1),
             "g_avg": round(float(np.mean([x["deg"] for x in m2_g_angle if x["deg"] > 0])), 1),
+            "m_data": [round(x["deg"], 1) for x in m2_m_angle],
+            "g_data": [round(x["deg"], 1) for x in m2_g_angle],
         },
         "metrik_3_lunge": {
             "m_max": round(float(np.max([x["px"] for x in m3_m_lunge])), 1) if m3_m_lunge else 0,
@@ -339,164 +451,480 @@ def analyze_video(video_path, progress_callback=None):
         "metrik_5_haltung": {
             "m_avg": round(float(np.mean([x["deg"] for x in m5_m_tilt])), 1) if m5_m_tilt else 0,
             "g_avg": round(float(np.mean([x["deg"] for x in m5_g_tilt])), 1) if m5_g_tilt else 0,
+            "m_data": [round(x["deg"], 1) for x in m5_m_tilt],
+            "g_data": [round(x["deg"], 1) for x in m5_g_tilt],
         },
         "metrik_6_acc": {
             "m_max": round(float(np.max([abs(x["acc"]) for x in m6_m_acc])), 1) if m6_m_acc else 0,
             "g_max": round(float(np.max([abs(x["acc"]) for x in m6_g_acc])), 1) if m6_g_acc else 0,
+            "m_data": [round(x["acc"], 1) for x in m6_m_acc],
+            "g_data": [round(x["acc"], 1) for x in m6_g_acc],
         },
         "metrik_7_schritte": {
-            "m_total": len(m7_m_steps),
-            "m_rate": round(len(m7_m_steps)/duration, 2) if duration > 0 else 0,
-            "g_total": len(m7_g_steps),
-            "g_rate": round(len(m7_g_steps)/duration, 2) if duration > 0 else 0,
+            "m_total": len(m7_m_steps), "m_rate": round(len(m7_m_steps)/duration, 2) if duration > 0 else 0,
+            "g_total": len(m7_g_steps), "g_rate": round(len(m7_g_steps)/duration, 2) if duration > 0 else 0,
             "m_halb": len([s for s in m7_m_steps if s["type"] == "halb"]),
             "m_ganz": len([s for s in m7_m_steps if s["type"] == "ganz"]),
+            "m_data": m7_m_steps,
+            "g_data": m7_g_steps,
         },
         "metrik_8_sync": {
-            "korrelation": round(m8_corr, 3),
-            "lag_frames": m8_lag,
-            "lag_s": round(m8_lag / fps, 2) if fps > 0 else 0,
+            "korrelation": round(m8_corr, 3), "lag_frames": m8_lag, "lag_s": round(m8_lag / fps, 2) if fps > 0 else 0,
             "leader": "Michael" if abs(m8_lag) > 2 and m8_lag > 0 else ("Gegner" if abs(m8_lag) > 2 else "neutral"),
+            "m_vel": [round(v, 1) for v in m8_vel_m],
+            "g_vel": [round(v, 1) for v in m8_vel_g],
         },
     }
 
     return {
         "summary": summary,
-        "frames": all_frames,
-        "m1_dist": m1_dist,
-        "m2_m_angle": m2_m_angle, "m2_g_angle": m2_g_angle,
+        "frame_data": frame_data,
+        "m1_dist": m1_dist, "m2_m_angle": m2_m_angle, "m2_g_angle": m2_g_angle,
         "m3_m_lunge": m3_m_lunge, "m3_g_lunge": m3_g_lunge,
         "m4_m_path": m4_m_path, "m4_g_path": m4_g_path,
         "m5_m_tilt": m5_m_tilt, "m5_g_tilt": m5_g_tilt,
         "m6_m_acc": m6_m_acc, "m6_g_acc": m6_g_acc,
         "m7_m_steps": m7_m_steps, "m7_g_steps": m7_g_steps,
         "m8_corr": m8_corr, "m8_lag": m8_lag,
-        "m8_vel_m": mv.tolist() if len(mv) > 0 else [],
-        "m8_vel_g": gv.tolist() if len(gv) > 0 else [],
-        "m9_m_pos": m9_m_pos, "m9_g_pos": m9_g_pos,
+        "m8_vel_m": m8_vel_m, "m8_vel_g": m8_vel_g,
     }
 
 
-# === PLOTLY CHARTS ===
+# === PLOTLY HELPER ===
+def fig_theme(fig, title="", xlabel="", ylabel=""):
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=13, color=C_TEXT), x=0.02),
+        paper_bgcolor=C_CARD, plot_bgcolor=C_CARD,
+        font=dict(color=C_TEXT, size=11),
+        xaxis=dict(gridcolor="#21262d", title=xlabel, color=C_MUTED, showline=True, linecolor=C_BORDER),
+        yaxis=dict(gridcolor="#21262d", title=ylabel, color=C_MUTED, showline=True, linecolor=C_BORDER),
+        margin=dict(l=40, r=16, t=28, b=28),
+        hovermode="x unified",
+        legend=dict(bgcolor="rgba(0,0,0,0.6)", bordercolor=C_BORDER, font=dict(size=10)),
+        dragmode=False,
+    )
+    fig.update_traces(hoverinfo="x+y")
+    return fig
 
-def plot_distanz(data):
-    fig = go.Figure()
-    ts = [d["t"] for d in data]
-    vals = [d["cm"] for d in data]
-    fig.add_trace(go.Scatter(x=ts, y=vals, mode="lines", name="Distanz",
-                             line=dict(color=C_BLUE, width=2), fill="tozeroy",
-                             fillcolor="rgba(0,204,255,0.1)"))
-    avg = np.mean(vals)
-    fig.add_hline(y=avg, line_dash="dash", line_color=C_BLUE,
-                  annotation_text=f"Mittel: {avg:.0f}cm",
-                  annotation_font=dict(size=11, color=C_MUTED))
-    return fig_theme(fig, "Distanz (Hueft-zu-Hueft)", ylabel="cm")
 
-def plot_winkel(m_data, g_data):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=[d["t"] for d in m_data], y=[d["deg"] for d in m_data],
-                             mode="lines", name="Michael", line=dict(color=C_GREEN, width=1.5)))
-    fig.add_trace(go.Scatter(x=[d["t"] for d in g_data], y=[d["deg"] for d in g_data],
-                             mode="lines", name="Gegner", line=dict(color=C_RED, width=1.5)))
-    return fig_theme(fig, "Waffenarm-Winkel", ylabel="Grad")
+# === INTERACTIVE LIVE PLAYER (HTML Component) ===
 
-def plot_lunge(m_data, g_data):
-    fig = go.Figure()
-    if m_data:
-        fig.add_trace(go.Scatter(x=[d["t"] for d in m_data], y=[d["px"] for d in m_data],
-                                 mode="lines", name="Michael", line=dict(color=C_GREEN, width=1.5)))
-    if g_data:
-        fig.add_trace(go.Scatter(x=[d["t"] for d in g_data], y=[d["px"] for d in g_data],
-                                 mode="lines", name="Gegner", line=dict(color=C_RED, width=1.5)))
-    return fig_theme(fig, "Lunge-Tiefe (Hueft-Knoechel vertikal)", ylabel="px")
+def build_live_player_html(result, clip_path, mode="auto"):
+    """
+    Generates a complete self-contained HTML page:
+    - Video player with canvas overlay (skeleton, distance, wrist angle)
+    - Toggle buttons (skeleton / distance / angle / timestamp)
+    - Shared time slider (RangeInput)
+    - Full Plotly charts (all 9 metrics synced to slider)
+    - Click on chart → jump video to that time
+    
+    mode: "embed" = base64 video + inline JSON
+          "server" = fetch from media server
+          "auto" = embed if < 30MB, else server
+    """
+    s = result["summary"]
+    fps = s["video"]["fps"]
+    duration = s["video"]["duration_s"]
+    vw = s["video"]["w"]
+    vh = s["video"]["h"]
 
-def plot_bewegungspfad(m_path, g_path):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=[p["x"] for p in m_path], y=[p["y"] for p in m_path],
-                             mode="markers", name="Michael",
-                             marker=dict(color=C_GREEN, size=3, opacity=0.5)))
-    fig.add_trace(go.Scatter(x=[p["x"] for p in g_path], y=[p["y"] for p in g_path],
-                             mode="markers", name="Gegner",
-                             marker=dict(color=C_RED, size=3, opacity=0.5)))
-    fig.update_yaxes(autorange="reversed", title="Y (Pixel)")
-    fig.update_xaxes(title="X (Pixel)")
-    fig.update_layout(yaxis=dict(scaleanchor="x", scaleratio=1))
-    return fig_theme(fig, "Bewegungs-Pfad (Hueft-Position)")
+    # Determine mode based on file size
+    clip_size_mb = clip_path.stat().st_size / (1024 * 1024)
+    if mode == "auto":
+        mode = "embed" if clip_size_mb < 30 else "server"
 
-def plot_haltung(m_data, g_data):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=[d["t"] for d in m_data], y=[d["deg"] for d in m_data],
-                             mode="lines", name="Michael", line=dict(color=C_GREEN, width=1.5)))
-    fig.add_trace(go.Scatter(x=[d["t"] for d in g_data], y=[d["deg"] for d in g_data],
-                             mode="lines", name="Gegner", line=dict(color=C_RED, width=1.5)))
-    fig.add_hline(y=0, line_color=C_BORDER, line_width=1,
-                  annotation_text="aufrecht", annotation_font=dict(size=10, color=C_MUTED))
-    return fig_theme(fig, "Koerperhaltung (Oberkoerper-Neigung)", ylabel="Grad")
+    if mode == "embed":
+        with open(clip_path, "rb") as f:
+            video_b64 = base64.b64encode(f.read()).decode("ascii")
+        video_url = f"data:video/mp4;base64,{video_b64}"
+        frame_json = json.dumps(result["frame_data"])
+        dist_data = json.dumps([d["cm"] for d in result["m1_dist"]])
+        m_angle_data = json.dumps([d["deg"] for d in result["m2_m_angle"]])
+        g_angle_data = json.dumps([d["deg"] for d in result["m2_g_angle"]])
+        m_haltung = json.dumps([d["deg"] for d in result["m5_m_tilt"]])
+        g_haltung = json.dumps([d["deg"] for d in result["m5_g_tilt"]])
+        m_acc = json.dumps([d["acc"] for d in result["m6_m_acc"]])
+        g_acc = json.dumps([d["acc"] for d in result["m6_g_acc"]])
+        m_steps = json.dumps(result["m7_m_steps"])
+        g_steps = json.dumps(result["m7_g_steps"])
+        m_vel = json.dumps(result["m8_vel_m"])
+        g_vel = json.dumps(result["m8_vel_g"])
+        m_path = json.dumps([{"x": p["x"], "y": p["y"]} for p in result["m4_m_path"]])
+        g_path = json.dumps([{"x": p["x"], "y": p["y"]} for p in result["m4_g_path"]])
+        data_block = f"""
+const FRAMES = {frame_json};
+const DIST_DATA = {dist_data};
+const M_ANGLE = {m_angle_data};
+const G_ANGLE = {g_angle_data};
+const M_HALTUNG = {m_haltung};
+const G_HALTUNG = {g_haltung};
+const M_ACC = {m_acc};
+const G_ACC = {g_acc};
+const M_STEPS = {m_steps};
+const G_STEPS = {g_steps};
+const M_VEL = {m_vel};
+const G_VEL = {g_vel};
+const M_PATH = {m_path};
+const G_PATH = {g_path};
+"""
+        video_src_block = f'<source src="{video_url}" type="video/mp4">'
+    else:
+        # Server mode: use the configured media server URL
+        video_url = "/video"
+        data_url = "/data.json"
+        video_src_block = f'<source src="{video_url}" type="video/mp4">'
+        data_block = """
+const MEDIA_BASE = '';
+let FRAMES = [];
+let DIST_DATA, M_ANGLE, G_ANGLE, M_HALTUNG, G_HALTUNG;
+let M_ACC, G_ACC, M_STEPS, G_STEPS, M_VEL, G_VEL, M_PATH, G_PATH;
 
-def plot_acc(m_data, g_data):
-    fig = go.Figure()
-    if m_data:
-        fig.add_trace(go.Scatter(x=[d["t"] for d in m_data], y=[d["acc"] for d in m_data],
-                                 mode="lines", name="Michael", line=dict(color=C_GREEN, width=1.2)))
-        vals = [abs(d["acc"]) for d in m_data]
-        if vals:
-            thresh = np.percentile(vals, 95)
-            peaks = [(d["t"], d["acc"]) for d in m_data if abs(d["acc"]) > thresh]
-            for t, v in peaks[:20]:
-                fig.add_annotation(x=t, y=v, text=f"{abs(v):.0f}", showarrow=True,
-                                   arrowhead=1, arrowsize=1, ax=0, ay=-20,
-                                   font=dict(size=8, color=C_GREEN), bgcolor="rgba(0,0,0,0.6)")
-    if g_data:
-        fig.add_trace(go.Scatter(x=[d["t"] for d in g_data], y=[d["acc"] for d in g_data],
-                                 mode="lines", name="Gegner", line=dict(color=C_RED, width=1.2)))
-    return fig_theme(fig, "Waffenhand-Beschleunigung", ylabel="px/s\u00b2")
+// Load data from server
+async function loadServerData() {
+    const resp = await fetch(MEDIA_BASE + '/data.json');
+    FRAMES = await resp.json();
+    const mResp = await fetch(MEDIA_BASE + '/metrics.json');
+    const metrics = await mResp.json();
+    DIST_DATA = metrics.dist;
+    M_ANGLE = metrics.m_angle; G_ANGLE = metrics.g_angle;
+    M_HALTUNG = metrics.m_haltung; G_HALTUNG = metrics.g_haltung;
+    M_ACC = metrics.m_acc; G_ACC = metrics.g_acc;
+    M_STEPS = metrics.m_steps; G_STEPS = metrics.g_steps;
+    M_VEL = metrics.m_vel; G_VEL = metrics.g_vel;
+    M_PATH = metrics.m_path; G_PATH = metrics.g_path;
+    drawFrame();
+}
+loadServerData();
+"""
 
-def plot_schritte(m_steps, g_steps, duration):
-    fig = go.Figure()
-    times = np.linspace(0, duration, 200)
-    m_cum = np.zeros_like(times)
-    g_cum = np.zeros_like(times)
-    for s in m_steps:
-        m_cum[times >= s["t"]] += 1
-    for s in g_steps:
-        g_cum[times >= s["t"]] += 1
-    fig.add_trace(go.Scatter(x=times, y=m_cum, mode="lines", name=f"Michael ({len(m_steps)})",
-                             line=dict(color=C_GREEN, width=2.5, shape="hv")))
-    fig.add_trace(go.Scatter(x=times, y=g_cum, mode="lines", name=f"Gegner ({len(g_steps)})",
-                             line=dict(color=C_RED, width=2.5, shape="hv")))
-    for s in m_steps:
-        color = {"halb": C_BLUE, "ganz": C_GREEN}.get(s["type"], C_GREEN)
-        fig.add_vline(x=s["t"], line_color=color, line_width=1, opacity=0.3)
-    return fig_theme(fig, "Schritt-Rhythmus", ylabel="Schritte (kumulativ)")
+    html = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
+<title>Fecht-Analyzer Live</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+* {{ box-sizing:border-box; margin:0; padding:0; }}
+body {{ background:#0d1117; color:#c9d1d9; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; min-height:100vh; padding:12px; }}
+.player-wrapper {{ max-width:960px; margin:0 auto; position:relative; background:#000; border-radius:10px; overflow:hidden; }}
+.player-wrapper video {{ width:100%; display:block; }}
+.player-wrapper canvas {{ position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }}
+.toolbar {{ display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px; background:#161b22; border:1px solid #30363d; border-radius:8px; margin-bottom:10px; align-items:center; }}
+.toolbar .toggle {{ display:flex; align-items:center; gap:4px; padding:5px 10px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; border:1px solid #30363d; background:#21262d; color:#c9d1d9; user-select:none; transition:all .15s; }}
+.toolbar .toggle.on {{ border-color:#58a6ff; }}
+.toolbar .toggle .dot {{ width:10px;height:10px;border-radius:50%; }}
+.toolbar .play-btn {{ padding:5px 16px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600; border:1px solid #2ea043; background:#238636; color:#fff; }}
+.toolbar .play-btn:hover {{ background:#2ea043; }}
+.toolbar .time-display {{ font-size:13px; font-weight:500; color:#8b949e; margin-left:auto; font-variant-numeric:tabular-nums; }}
+.video-stats {{ display:flex; flex-wrap:wrap; gap:8px; padding:8px 12px; background:#161b22; border:1px solid #30363d; border-top:none; border-radius:0 0 8px 8px; }}
+.video-stats .stat {{ text-align:center; padding:2px 12px; }}
+.video-stats .stat .val {{ font-size:16px; font-weight:600; }}
+.video-stats .stat .lbl {{ font-size:10px; color:#8b949e; text-transform:uppercase; letter-spacing:.3px; }}
+.timebar-wrapper {{ padding:10px 0; }}
+input[type="range"] {{ width:100%; height:6px; -webkit-appearance:none; appearance:none; background:#21262d; border-radius:3px; outline:none; }}
+input[type="range"]::-webkit-slider-thumb {{ -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:#58a6ff; cursor:pointer; border:2px solid #0d1117; }}
+input[type="range"]::-moz-range-thumb {{ width:16px; height:16px; border-radius:50%; background:#58a6ff; cursor:pointer; border:2px solid #0d1117; }}
+.charts-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }}
+.chart-cell {{ background:#161b22; border:1px solid #30363d; border-radius:6px; padding:6px; min-height:180px; }}
+.charts-title {{ font-size:14px; font-weight:600; color:#c9d1d9; margin:12px 0 4px; }}
+@media (max-width:700px) {{ .charts-grid {{ grid-template-columns:1fr; }} }}
+</style>
+</head>
+<body>
 
-def plot_sync(vel_m, vel_g, frames):
-    fig = go.Figure()
-    ts = np.linspace(0, len(vel_m)/30, len(vel_m)) if vel_m else []
-    if len(ts) > 0:
-        fig.add_trace(go.Scatter(x=ts, y=vel_m, mode="lines", name="Michael",
-                                 line=dict(color=C_GREEN, width=1.5), opacity=0.8))
-        fig.add_trace(go.Scatter(x=ts, y=vel_g, mode="lines", name="Gegner",
-                                 line=dict(color=C_RED, width=1.5), opacity=0.8))
-    return fig_theme(fig, "Reaktions-Synchronisierung (Hueft-Geschwindigkeit)", ylabel="px/s")
+<div class="player-wrapper">
+  <video id="vid" preload="auto" playsinline>
+    {video_src_block}
+  </video>
+  <canvas id="overlay"></canvas>
+</div>
 
-def plot_heatmap(m_pos, g_pos):
-    fig = go.Figure()
-    if m_pos and g_pos:
-        all_x = [p["x"] for p in m_pos] + [p["x"] for p in g_pos]
-        all_y = [p["y"] for p in m_pos] + [p["y"] for p in g_pos]
-        fig.add_trace(go.Histogram2d(
-            x=all_x, y=all_y, colorscale="Plasma", nbinsx=30, nbinsy=20,
-            opacity=0.7, showscale=True, colorbar=dict(title="Dichte", titleside="right")
-        ))
-    fig.add_trace(go.Scatter(x=[p["x"] for p in m_pos], y=[p["y"] for p in m_pos],
-                             mode="markers", name="Michael",
-                             marker=dict(color=C_GREEN, size=4, opacity=0.3)))
-    fig.add_trace(go.Scatter(x=[p["x"] for p in g_pos], y=[p["y"] for p in g_pos],
-                             mode="markers", name="Gegner",
-                             marker=dict(color=C_RED, size=4, opacity=0.3)))
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(yaxis=dict(scaleanchor="x", scaleratio=1))
-    return fig_theme(fig, "Positions-Heatmap (Piste)", xlabel="X (Pixel)", ylabel="Y (Pixel)")
+<div class="toolbar">
+  <button class="play-btn" id="playBtn">▶ Abspielen</button>
+  <div class="toggle on" data-layer="skeleton"><span class="dot" style="background:#00ff88"></span> Skelett</div>
+  <div class="toggle on" data-layer="distance"><span class="dot" style="background:#00ccff"></span> Distanz</div>
+  <div class="toggle on" data-layer="angle"><span class="dot" style="background:#ffaa00"></span> Winkel</div>
+  <div class="toggle on" data-layer="time"><span class="dot" style="background:#8b949e"></span> Zeit</div>
+  <div class="time-display" id="timeDisplay">00:00.0 / 00:00.0</div>
+</div>
+
+<div class="timebar-wrapper">
+  <input type="range" id="timeSlider" min="0" max="{duration}" step="0.1" value="0">
+</div>
+
+<div class="video-stats">
+  <div class="stat"><div class="val" id="statDist">-</div><div class="lbl">Distanz</div></div>
+  <div class="stat"><div class="val" id="statAngle">-</div><div class="lbl">Winkel M/G</div></div>
+  <div class="stat"><div class="val" id="statSteps">0</div><div class="lbl">Schritte</div></div>
+  <div class="stat"><div class="val" id="statAcc">-</div><div class="lbl">Max Beschl</div></div>
+</div>
+
+<div class="charts-title">📊 Metriken</div>
+<div class="charts-grid" id="chartsGrid"></div>
+
+<script>
+// ===== DATA =====
+{data_block}
+const DURATION = {duration};
+const FPS = {fps};
+const VW = {vw};
+const VH = {vh};
+
+// ===== VIDEO & CANVAS =====
+const vid = document.getElementById('vid');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+canvas.width = VW;
+canvas.height = VH;
+
+// ===== TOGGLES =====
+const layers = {{ skeleton: true, distance: true, angle: true, time: true }};
+document.querySelectorAll('.toggle').forEach(el => {{
+  el.addEventListener('click', () => {{
+    const key = el.dataset.layer;
+    layers[key] = !layers[key];
+    el.classList.toggle('on');
+    drawFrame();
+  }});
+}});
+
+// ===== PLAY BUTTON =====
+const playBtn = document.getElementById('playBtn');
+playBtn.addEventListener('click', () => {{
+  if (vid.paused) {{ vid.play(); playBtn.textContent = '⏸ Pause'; }}
+  else {{ vid.pause(); playBtn.textContent = '▶ Abspielen'; }}
+}});
+vid.addEventListener('pause', () => playBtn.textContent = '▶ Abspielen');
+vid.addEventListener('play', () => playBtn.textContent = '⏸ Pause');
+
+// ===== SKELETON DEFINITION =====
+const SKEL = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+
+// ===== DRAW FRAME =====
+function drawFrame() {{
+  const t = vid.currentTime;
+  // Find nearest frame
+  let fi = 0;
+  for (let i = 0; i < FRAMES.length; i++) {{
+    if (FRAMES[i].t >= t) {{ fi = i; break; }}
+  }}
+  if (fi >= FRAMES.length) fi = FRAMES.length - 1;
+  const f = FRAMES[fi];
+  if (!f) return;
+
+  ctx.clearRect(0, 0, VW, VH);
+
+  // Helper: get keypoint
+  function getKP(flat, idx) {{
+    if (!flat) return null;
+    const x = flat[idx*2], y = flat[idx*2+1];
+    return (x > 0 && y > 0) ? [x, y] : null;
+  }}
+
+  function drawPerson(flat, color, label) {{
+    if (!flat) return;
+    // Skeleton
+    if (layers.skeleton) {{
+      for (const [a,b] of SKEL) {{
+        const p1 = getKP(flat, a), p2 = getKP(flat, b);
+        if (p1 && p2) {{
+          ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]);
+          ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+        }}
+      }}
+      for (let i = 0; i < 17; i++) {{
+        const p = getKP(flat, i);
+        if (p) {{
+          ctx.beginPath(); ctx.arc(p[0],p[1], 3, 0, Math.PI*2);
+          ctx.fillStyle = color; ctx.fill();
+          ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+        }}
+      }}
+      // Label
+      const nose = getKP(flat, 0);
+      if (nose) {{
+        ctx.font = 'bold 11px sans-serif'; ctx.fillStyle = color; ctx.textAlign = 'center';
+        ctx.fillText(label, nose[0], nose[1] - 14);
+      }}
+    }}
+
+    // Distance (from Michael)
+    if (layers.distance && label === 'Michael') {{
+      const mHip = getMid(flat, 11, 12);
+      if (mHip && f.g) {{
+        const gHip = getMid(f.g, 11, 12);
+        if (gHip) {{
+          const dx = mHip[0] - gHip[0], dy = mHip[1] - gHip[1];
+          const d = Math.hypot(dx, dy);
+          ctx.font = 'bold 20px sans-serif'; ctx.fillStyle = '#00ccff'; ctx.textAlign = 'right';
+          ctx.fillText(Math.round(d / 0.65) + ' cm', VW - 12, 30);
+          // Line between hips
+          ctx.beginPath(); ctx.moveTo(mHip[0],mHip[1]); ctx.lineTo(gHip[0],gHip[1]);
+          ctx.strokeStyle = 'rgba(0,204,255,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([4,4]); ctx.stroke(); ctx.setLineDash([]);
+        }}
+      }}
+    }}
+
+    // Wrist angle
+    if (layers.angle) {{
+      // Right arm angle (Michael), Left arm (opponent)
+      const s = label === 'Michael' ? [getKP(flat,6),getKP(flat,8),getKP(flat,10)] : [getKP(flat,5),getKP(flat,7),getKP(flat,9)];
+      if (s[0] && s[1] && s[2]) {{
+        const v1 = [s[0][0]-s[1][0], s[0][1]-s[1][1]];
+        const v2 = [s[2][0]-s[1][0], s[2][1]-s[1][1]];
+        const n1 = Math.hypot(v1[0],v1[1]), n2 = Math.hypot(v2[0],v2[1]);
+        if (n1 > 1 && n2 > 1) {{
+          const cosA = Math.max(-1, Math.min(1, (v1[0]*v2[0]+v1[1]*v2[1])/(n1*n2)));
+          const deg = Math.round(Math.acos(cosA) * 180 / Math.PI);
+          ctx.font = '12px sans-serif'; ctx.fillStyle = '#ffaa00'; ctx.textAlign = 'center';
+          ctx.fillText(deg + '°', s[1][0], s[1][1] - 8);
+        }}
+      }}
+    }}
+  }}
+
+  function getMid(flat, i1, i2) {{
+    const a = getKP(flat, i1), b = getKP(flat, i2);
+    return (a && b) ? [(a[0]+b[0])/2, (a[1]+b[1])/2] : null;
+  }}
+
+  drawPerson(f.m, '#00ff88', 'Michael');
+  drawPerson(f.g, '#ff4466', 'Gegner');
+
+  // Timestamp
+  if (layers.time) {{
+    const mins = Math.floor(t/60), secs = Math.floor(t%60), ds = Math.floor((t%1)*10);
+    const ts = String(mins).padStart(2,'0') + ':' + String(secs).padStart(2,'0') + '.' + ds;
+    ctx.font = '13px monospace'; ctx.fillStyle = 'rgba(200,200,200,0.7)'; ctx.textAlign = 'left';
+    ctx.fillText(ts, 10, VH - 12);
+  }}
+
+  // Update stats
+  const mHip = getMid(f.m, 11, 12);
+  const gHip = getMid(f.g, 11, 12);
+  if (mHip && gHip) {{
+    const d = Math.hypot(mHip[0]-gHip[0], mHip[1]-gHip[1]);
+    document.getElementById('statDist').textContent = Math.round(d / 0.65) + 'cm';
+  }}
+  document.getElementById('statAngle').textContent = (M_ANGLE[fi] || 0).toFixed(0) + '/' + (G_ANGLE[fi] || 0).toFixed(0);
+  document.getElementById('statAcc').textContent = (M_ACC[fi-2] || 0).toFixed(0);
+}}
+
+// ===== TIME UPDATE =====
+let isSeeking = false;
+
+vid.addEventListener('timeupdate', () => {{
+  document.getElementById('timeSlider').value = vid.currentTime;
+  document.getElementById('timeDisplay').textContent = formatTime(vid.currentTime) + ' / ' + formatTime(DURATION);
+  if (!isSeeking) drawFrame();
+}});
+
+vid.addEventListener('seeking', () => {{ isSeeking = true; drawFrame(); }});
+vid.addEventListener('seeked', () => {{ isSeeking = false; }});
+
+// ===== SLIDER =====
+document.getElementById('timeSlider').addEventListener('input', (e) => {{
+  const t = parseFloat(e.target.value);
+  vid.currentTime = t;
+  document.getElementById('timeDisplay').textContent = formatTime(t) + ' / ' + formatTime(DURATION);
+  drawFrame();
+  // Update chart vlines
+  chartTimes.forEach(cb => cb(t));
+}});
+
+function formatTime(s) {{
+  const m = Math.floor(s/60), sec = Math.floor(s%60), ds = Math.floor((s%1)*10);
+  return String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0') + '.' + ds;
+}}
+
+// ===== PLOTLY CHARTS =====
+const chartTimes = [];
+
+function makeChart(containerId, title, xData, yData, color, yTitle) {{
+  const steps = yData.length;
+  const times = Array.from({{length: steps}}, (_,i) => i * (DURATION / (steps-1 || 1)));
+  const trace = {{
+    x: times, y: yData, type: 'scatter', mode: 'lines',
+    line: {{color: color, width: 1.5}}, name: title,
+  }};
+  const layout = {{
+    title: {{text: title, font: {{size: 12, color: '#c9d1d9'}}, x: 0.02}},
+    paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+    font: {{color: '#8b949e', size: 10}},
+    xaxis: {{gridcolor: '#21262d', showticklabels: false, showline: true, linecolor: '#30363d', zeroline: false}},
+    yaxis: {{gridcolor: '#21262d', title: yTitle || '', color: '#8b949e', showline: true, linecolor: '#30363d', zeroline: false}},
+    margin: {{l: 40, r: 10, t: 24, b: 20}},
+    hovermode: 'x unified',
+    dragmode: false,
+    shapes: [],
+    showlegend: false,
+  }};
+  const config = {{displayModeBar: false, responsive: true}};
+  Plotly.newPlot(containerId, [trace], layout, config);
+
+  // Click handler - jump video
+  document.getElementById(containerId).on('plotly_click', (data) => {{
+    if (data.points.length > 0) {{
+      const t = data.points[0].x;
+      vid.currentTime = t;
+      document.getElementById('timeSlider').value = t;
+      document.getElementById('timeDisplay').textContent = formatTime(t) + ' / ' + formatTime(DURATION);
+      drawFrame();
+    }}
+  }});
+
+  // VLine updater
+  const vlineUpdater = (t) => {{
+    const update = {{shapes: [{{
+      type: 'line', x0: t, x1: t, y0: 0, y1: 1, yref: 'paper',
+      line: {{color: '#58a6ff', width: 1.5, dash: 'dot'}}
+    }}]}};
+    Plotly.relayout(containerId, update);
+  }};
+  chartTimes.push(vlineUpdater);
+}}
+
+// Build charts grid
+const chartSpecs = [
+  ['ch1', 'Distanz', DIST_DATA, '#00ccff', 'cm'],
+  ['ch2', 'Winkel M', M_ANGLE, '#00ff88', '°'],
+  ['ch3', 'Winkel G', G_ANGLE, '#ff4466', '°'],
+  ['ch4', 'Haltung M', M_HALTUNG, '#00ff88', '°'],
+  ['ch5', 'Haltung G', G_HALTUNG, '#ff4466', '°'],
+  ['ch6', 'Beschl. M', M_ACC, '#00ff88', 'px/s²'],
+  ['ch7', 'Beschl. G', G_ACC, '#ff4466', 'px/s²'],
+  ['ch8', 'Sync M', M_VEL, '#00ff88', 'px/s'],
+  ['ch9', 'Sync G', G_VEL, '#ff4466', 'px/s'],
+];
+
+const grid = document.getElementById('chartsGrid');
+chartSpecs.forEach(([id, name, data, color, unit]) => {{
+  const cell = document.createElement('div');
+  cell.className = 'chart-cell';
+  cell.id = id;
+  grid.appendChild(cell);
+  // Delay rendering for perf
+  setTimeout(() => makeChart(id, name, null, data, color, unit), 10);
+}});
+
+// ===== INITIAL DRAW =====
+vid.addEventListener('loadedmetadata', () => {{
+  drawFrame();
+  document.getElementById('timeDisplay').textContent = '00:00.0 / ' + formatTime(DURATION);
+}});
+
+// Mobile: handle touch play
+if ('ontouchstart' in window) {{
+  vid.addEventListener('touchstart', () => {{
+    if (vid.paused) vid.play();
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+    return html
 
 
 # === STREAMLIT UI ===
@@ -508,11 +936,13 @@ def main():
     div[data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #30363d; }
     .stProgress > div > div > div > div { background: #58a6ff; }
     h1, h2, h3 { color: #c9d1d9 !important; }
+    .st-emotion-cache-1y4p8pa { max-width: 100%; padding: 1rem; }
+    iframe { width: 100% !important; min-height: 800px; }
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("Fecht-Analyzer")
-    st.caption("YOLOv8m-Pose | 9 Metriken | Interaktives Dashboard")
+    st.title("🤺 Fecht-Analyzer")
+    st.caption("YOLOv8m-Pose | 9 Metriken | Live-Video-Player mit synchronisierten Charts")
 
     with st.sidebar:
         st.header("Video-Quelle")
@@ -541,12 +971,14 @@ def main():
             st.divider()
             st.header("Clip-Einstellungen")
             start_sec = st.number_input("Startzeit (s)", min_value=0, value=0, step=5)
-            clip_duration = st.number_input("Dauer (s)", min_value=5, value=15, max_value=120, step=5)
+            clip_duration = st.number_input("Dauer (s)", min_value=5, value=15, max_value=900, step=5,
+                                           help="Maximal 15 Minuten (900s)")
             cap = cv2.VideoCapture(str(video_path))
             total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
             cap.release()
-            st.caption(f"{total_f} Frames @ {vid_fps:.0f}fps = {total_f/vid_fps:.0f}s Gesamt")
+            vid_dur = total_f / vid_fps if vid_fps > 0 else 0
+            st.caption(f"{total_f} Frames @ {vid_fps:.0f}fps = {vid_dur:.0f}s Gesamt")
             analyze_btn = st.button("Analyse starten", type="primary", use_container_width=True)
         else:
             analyze_btn = False
@@ -554,16 +986,24 @@ def main():
     if video_path and analyze_btn:
         run_analysis(video_path, start_sec, clip_duration)
     elif "result" in st.session_state:
-        display_dashboard(st.session_state["result"])
+        display_player(st.session_state["result"], st.session_state["clip_path"])
     else:
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            st.info("Video auswaehlen und Analyse starten")
+            st.info("📁 Video auswählen und Analyse starten")
             st.markdown("""
-            **Verfuegbare Metriken:**
-            1. Distanz | 2. Waffenarm-Winkel | 3. Lunge-Tiefe  
-            4. Bewegungs-Pfad | 5. Koerperhaltung | 6. Beschleunigung  
-            7. Schritte (halb/ganz) | 8. Synchronisierung | 9. Heatmap
+            **9 Metriken — Live im Player:**
+            1. Distanz  
+            2. Waffenarm-Winkel  
+            3. Lunge-Tiefe  
+            4. Bewegungs-Pfad  
+            5. Körperhaltung  
+            6. Beschleunigung  
+            7. Schritt-Rhythmus  
+            8. Synchronisierung  
+            9. Heatmap  
+            
+            **Toggle:** Skelett, Distanz, Winkel, Zeit — ein/aus per Klick
             """)
 
 
@@ -576,7 +1016,8 @@ def run_analysis(video_path, start_sec, clip_duration):
     if not ok:
         st.error("Clip-Extraktion fehlgeschlagen")
         return
-    clip_progress.progress(100, text="Clip bereit")
+    clip_size = clip_path.stat().st_size / 1e6
+    clip_progress.progress(100, text=f"Clip bereit ({clip_size:.1f} MB) — verpacke Daten...")
 
     status = st.status("Analysiere Video...", expanded=True)
     status.write("YOLOv8m-Pose geladen")
@@ -589,13 +1030,17 @@ def run_analysis(video_path, start_sec, clip_duration):
         status.write("Extrahiere Keypoints & Tracke Fechter...")
         result = analyze_video(clip_path, progress_callback=on_progress)
         progress_bar.progress(1.0)
-        status.write("Analyse abgeschlossen")
+        status.write("Analyse abgeschlossen. Baue Live-Player...")
         status.update(state="complete")
+
         st.session_state["result"] = result
         st.session_state["clip_path"] = clip_path
+
+        # JSON summary
         json_path = clip_path.with_suffix(".json")
         with open(json_path, "w") as f:
             json.dump(result["summary"], f, indent=2)
+
         st.rerun()
     except Exception as e:
         status.update(state="error")
@@ -604,136 +1049,36 @@ def run_analysis(video_path, start_sec, clip_duration):
         st.code(traceback.format_exc())
 
 
-def display_dashboard(result):
-    s = result["summary"]
-
-    # Key Stats
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("Distanz", f'{s["metrik_1_distanz"]["avg_cm"]}cm')
-    with col2:
-        st.metric("Schritte/s", f'{s["metrik_7_schritte"]["m_rate"]+s["metrik_7_schritte"]["g_rate"]:.2f}')
-    with col3:
-        st.metric("Winkel M/G", f'{s["metrik_2_winkel"]["m_avg"]:.0f}/{s["metrik_2_winkel"]["g_avg"]:.0f}')
-    with col4:
-        st.metric("Korrelation", f'{s["metrik_8_sync"]["korrelation"]:.2f}')
-    with col5:
-        acc_max = max(s["metrik_6_acc"]["m_max"], s["metrik_6_acc"]["g_max"])
-        st.metric("Max Beschl.", f'{acc_max:.0f}')
-
-    st.divider()
-
-    # Schritt-Detail
-    with st.expander("Schritt-Detail (Michael)", expanded=True):
-        m_steps = result.get("m7_m_steps", [])
-        g_steps = result.get("m7_g_steps", [])
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            m_halb = len([s for s in m_steps if s["type"] == "halb"])
-            m_ganz = len([s for s in m_steps if s["type"] == "ganz"])
-            st.metric("Halbe Schritte", m_halb, help="Nur vorderer Fuss")
-            st.metric("Ganze Schritte", m_ganz, help="Beide Fuesse nacheinander")
-        with c2:
-            g_halb = len([s for s in g_steps if s["type"] == "halb"])
-            g_ganz = len([s for s in g_steps if s["type"] == "ganz"])
-            st.metric("Gegner Halbe", g_halb)
-            st.metric("Gegner Ganze", g_ganz)
-        with c3:
-            st.markdown("**Farbcode:**")
-            st.markdown('<span style="color:#58a6ff">Blau</span> = Halb', unsafe_allow_html=True)
-            st.markdown('<span style="color:#00ff88">Gruen</span> = Ganz', unsafe_allow_html=True)
-
-        # Tabelle
-        if m_steps:
-            html_rows = ""
-            for step in m_steps:
-                color = {"halb": "rgba(88,166,255,0.08)", "ganz": "rgba(46,160,67,0.08)"}.get(step["type"], "")
-                icon = "\u279c" if step["side"] == "rechts" else "\u2b05"
-                html_rows += f"""<tr style="background:{color}">
-                    <td>{step['t']:.1f}s</td>
-                    <td>{icon} {step['side']}</td>
-                    <td><b>{step['type'].upper()}</b></td>
-                    <td>{step['dist']:.0f}px</td></tr>"""
-            st.markdown(f"""
-            <table style="width:100%;border-collapse:collapse;font-size:13px;color:#c9d1d9;">
-            <thead><tr style="background:#21262d;">
-                <th style="padding:6px 10px;border-bottom:2px solid #30363d;">Zeit</th>
-                <th style="padding:6px 10px;border-bottom:2px solid #30363d;">Seite</th>
-                <th style="padding:6px 10px;border-bottom:2px solid #30363d;">Typ</th>
-                <th style="padding:6px 10px;border-bottom:2px solid #30363d;">Distanz</th>
-            </tr></thead><tbody>{html_rows}</tbody></table>""", unsafe_allow_html=True)
-        else:
-            st.info("Keine Schritte erkannt")
-
-    # Toggles
-    st.divider()
-    st.subheader("Metriken-Dashboard")
-    metric_names = [
-        ("1_dist", "Distanz", True), ("2_winkel", "Winkel", True),
-        ("3_lunge", "Lunge", True), ("4_pfad", "Pfad", True),
-        ("5_haltung", "Haltung", True), ("6_acc", "Beschl.", True),
-        ("7_schritte", "Schritte", True), ("8_sync", "Sync", True),
-        ("9_heatmap", "Heatmap", True),
-    ]
-    cols = st.columns(9)
-    toggles = {}
-    for i, (key, label, _) in enumerate(metric_names):
-        with cols[i]:
-            toggles[key] = st.checkbox(label, value=True, key=f"t_{key}")
-
-    # Charts
-    c_left, c_right = st.columns(2)
-    chart_specs = [
-        ("1_dist", plot_distanz, result["m1_dist"]),
-        ("2_winkel", plot_winkel, result["m2_m_angle"], result["m2_g_angle"]),
-        ("3_lunge", plot_lunge, result["m3_m_lunge"], result["m3_g_lunge"]),
-        ("4_pfad", plot_bewegungspfad, result["m4_m_path"], result["m4_g_path"]),
-        ("5_haltung", plot_haltung, result["m5_m_tilt"], result["m5_g_tilt"]),
-        ("6_acc", plot_acc, result["m6_m_acc"], result["m6_g_acc"]),
-        ("7_schritte", plot_schritte, result["m7_m_steps"], result["m7_g_steps"], s["video"]["duration_s"]),
-        ("8_sync", plot_sync, result["m8_vel_m"], result["m8_vel_g"], result["frames"]),
-        ("9_heatmap", plot_heatmap, result["m9_m_pos"], result["m9_g_pos"]),
-    ]
-
-    for i, spec in enumerate(chart_specs):
-        key = spec[0]
-        with c_left if i % 2 == 0 else c_right:
-            if toggles.get(key, True):
-                try:
-                    fig = spec[1](*spec[2:])
-                    st.plotly_chart(fig, use_container_width=True, key=f"c_{key}")
-                except Exception as e:
-                    st.error(f"Chart {key}: {e}")
-
-    # Export
-    st.divider()
-    st.subheader("Export")
-    ec1, ec2, ec3, ec4 = st.columns(4)
-    json_bytes = json.dumps(s, indent=2).encode("utf-8")
-    ec1.download_button("JSON", data=json_bytes, file_name="fencing_analysis.json", mime="application/json")
-    m_steps = result.get("m7_m_steps", [])
-    if m_steps:
-        df_steps = pd.DataFrame(m_steps)
-        csv = df_steps.to_csv(index=False).encode("utf-8")
-        ec2.download_button("Schritte-CSV", data=csv, file_name="steps.csv", mime="text/csv")
-    if result.get("m1_dist"):
-        csv_d = pd.DataFrame(result["m1_dist"]).to_csv(index=False).encode("utf-8")
-        ec3.download_button("Distanz-CSV", data=csv_d, file_name="distance.csv", mime="text/csv")
-
-    summary_text = f"""Fecht-Analyse Ergebnis
-========================
-Dauer: {s['video']['duration_s']}s | Frames: {s['video']['frames']} | {s['video']['fps']}fps
-
-1. DISTANZ: {s['metrik_1_distanz']['avg_cm']}cm Oe
-2. WINKEL: Michael {s['metrik_2_winkel']['m_avg']} | Gegner {s['metrik_2_winkel']['g_avg']}
-3. LUNGE: Michael max {s['metrik_3_lunge']['m_max']}px | Gegner max {s['metrik_3_lunge']['g_max']}px
-5. HALTUNG: Michael {s['metrik_5_haltung']['m_avg']} | Gegner {s['metrik_5_haltung']['g_avg']}
-6. BESCHL.: Michael max {s['metrik_6_acc']['m_max']} | Gegner max {s['metrik_6_acc']['g_max']}
-7. SCHRITTE: Michael {s['metrik_7_schritte']['m_total']} ({s['metrik_7_schritte']['m_rate']}/s) | Gegner {s['metrik_7_schritte']['g_total']}
-   Halb: {s['metrik_7_schritte']['m_halb']} | Ganz: {s['metrik_7_schritte']['m_ganz']}
-8. SYNCHRONISIERUNG: Korr {s['metrik_8_sync']['korrelation']} | Lag {s['metrik_8_sync']['lag_s']}s
-"""
-    ec4.download_button("Report-TXT", data=summary_text.encode("utf-8"), file_name="fencing_report.txt")
+def display_player(result, clip_path):
+    """Render the live video player with canvas overlay and synced charts."""
+    clip_size_mb = clip_path.stat().st_size / (1024 * 1024)
+    
+    if clip_size_mb >= 30:
+        # Large video: start media server
+        s = result["summary"]
+        metrics_payload = {
+            "dist": [d["cm"] for d in result["m1_dist"]],
+            "m_angle": [d["deg"] for d in result["m2_m_angle"]],
+            "g_angle": [d["deg"] for d in result["m2_g_angle"]],
+            "m_haltung": [d["deg"] for d in result["m5_m_tilt"]],
+            "g_haltung": [d["deg"] for d in result["m5_g_tilt"]],
+            "m_acc": [d["acc"] for d in result["m6_m_acc"]],
+            "g_acc": [d["acc"] for d in result["m6_g_acc"]],
+            "m_steps": result["m7_m_steps"],
+            "g_steps": result["m7_g_steps"],
+            "m_vel": result["m8_vel_m"],
+            "g_vel": result["m8_vel_g"],
+            "m_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_m_path"]],
+            "g_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_g_path"]],
+        }
+        base_url = start_media_server(clip_path, result["frame_data"], metrics_payload)
+        html_content = build_live_player_html(result, clip_path, mode="server")
+        # Replace placeholder base URL
+        html_content = html_content.replace("const MEDIA_BASE = '';", f"const MEDIA_BASE = '{base_url}';")
+    else:
+        html_content = build_live_player_html(result, clip_path, mode="embed")
+    
+    st_html(html_content, height=950, scrolling=False)
 
 
 if __name__ == "__main__":
