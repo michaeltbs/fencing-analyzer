@@ -192,9 +192,10 @@ def extract_clip(video_path, output_path, start_sec=0, duration_sec=15, target_w
     subprocess.run(cmd, capture_output=True, timeout=600)
     return output_path.exists()
 
-def analyze_video(video_path, progress_callback=None):
+def analyze_video(video_path, progress_callback=None, model=None):
     """Returns result dict with frames (keypoints per frame), metrics, summary."""
-    model = load_model()
+    if model is None:
+        model = load_model()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError("Video konnte nicht geoeffnet werden")
@@ -968,45 +969,36 @@ def main():
                     st.error("Datei nicht gefunden")
 
         if video_path:
-            st.divider()
-            st.header("Analyse-Zeitraum")
-            
-            cap = cv2.VideoCapture(str(video_path))
-            total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            cap.release()
-            vid_dur = total_f / vid_fps if vid_fps > 0 else 0
-            
-            st.caption(f"📹 {total_f} Frames @ {vid_fps:.0f}fps = {vid_dur:.0f}s Gesamt")
-            
-            # Zwei Slider als Timeline: Start und Ende
-            col_a, col_b = st.columns(2)
-            with col_a:
-                clip_start = st.number_input("Start (s)", min_value=0, max_value=int(vid_dur), 
-                                            value=0, step=5)
-            with col_b:
-                clip_end = st.number_input("Ende (s)", min_value=1, max_value=int(vid_dur),
-                                          value=min(30, int(vid_dur)), step=5)
-            
-            if clip_end <= clip_start:
-                st.warning("Ende muss nach Start liegen")
-                clip_duration = 0
-                analyze_btn = False
-            else:
-                clip_duration = clip_end - clip_start
-                st.caption(f"📊 Dauer: {clip_duration}s — ca. {int(clip_duration * vid_fps)} Frames")
-                analyze_btn = st.button("Analyse starten", type="primary", use_container_width=True)
-        else:
-            analyze_btn = False
+            # Nur setzen wenn noch nicht in session_state
+            vp_key = str(video_path.resolve())
+            if st.session_state.get("video_path_key") != vp_key:
+                cap = cv2.VideoCapture(str(video_path))
+                total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                cap.release()
+                vid_dur = total_f / vid_fps if vid_fps > 0 else 0
+                vid_name = Path(video_path).name
+                st.caption(f"\U0001F4F9 {vid_name} — {vid_dur:.0f}s @ {vid_fps:.0f}fps")
 
-    if video_path and analyze_btn:
-        run_analysis(video_path, clip_start, clip_duration)
+                st.session_state["video_path"] = video_path
+                st.session_state["video_path_key"] = vp_key
+                st.session_state["vid_dur"] = vid_dur
+                st.session_state["vid_fps"] = vid_fps
+                st.session_state["vid_name"] = vid_name
+                st.rerun()
+            else:
+                st.caption(f"\U0001F4F9 {st.session_state['vid_name']} — {st.session_state['vid_dur']:.0f}s @ {st.session_state['vid_fps']:.0f}fps")
+
+    if st.session_state.get("analysis_running"):
+        show_analysis_progress()
     elif "result" in st.session_state:
         display_player(st.session_state["result"], st.session_state["clip_path"])
+    elif "video_path" in st.session_state:
+        display_video_viewer()
     else:
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            st.info("📁 Video auswählen und Analyse starten")
+            st.info("\U0001F4C1 Video auswählen und Analyse starten")
             st.markdown("""
             **9 Metriken — Live im Player:**
             1. Distanz  
@@ -1018,51 +1010,82 @@ def main():
             7. Schritt-Rhythmus  
             8. Synchronisierung  
             9. Heatmap  
-            
+
             **Toggle:** Skelett, Distanz, Winkel, Zeit — ein/aus per Klick
             """)
 
 
+WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker_analyze.py")
+
+
 def run_analysis(video_path, start_sec, clip_duration):
-    st.session_state.pop("result", None)
+    """Extrahiere Clip + starte Worker-Subprocess. Fragment pollt Ergebnis-Datei."""
     clip_progress = st.progress(0, text="Extrahiere Clip...")
-    clip_path = Path(tempfile.gettempdir()) / f"fencing_clip_{int(time.time())}.mp4"
+    timestamp = int(time.time())
+    clip_path = Path(tempfile.gettempdir()) / f"fencing_clip_{timestamp}.mp4"
+    result_path = Path(tempfile.gettempdir()) / f"fencing_result_{timestamp}.json"
 
     ok = extract_clip(video_path, clip_path, start_sec, clip_duration)
     if not ok:
         st.error("Clip-Extraktion fehlgeschlagen")
         return
     clip_size = clip_path.stat().st_size / 1e6
-    clip_progress.progress(100, text=f"Clip bereit ({clip_size:.1f} MB) — verpacke Daten...")
+    clip_progress.progress(100, text=f"Clip bereit ({clip_size:.1f} MB)")
 
-    status = st.status("Analysiere Video...", expanded=True)
-    status.write("YOLOv8m-Pose geladen")
-    progress_bar = st.progress(0)
+    # Worker im Subprocess starten (complett autark, blockiert UI nicht)
+    subprocess.Popen(
+        [
+            sys.executable,
+            WORKER_SCRIPT,
+            str(clip_path),
+            str(result_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+    )
 
-    def on_progress(pct):
-        progress_bar.progress(min(pct, 1.0))
+    st.session_state["analysis_result_path"] = str(result_path)
+    st.session_state["analysis_running"] = True
+    st.rerun()
 
-    try:
-        status.write("Extrahiere Keypoints & Tracke Fechter...")
-        result = analyze_video(clip_path, progress_callback=on_progress)
-        progress_bar.progress(1.0)
-        status.write("Analyse abgeschlossen. Baue Live-Player...")
-        status.update(state="complete")
 
-        st.session_state["result"] = result
-        st.session_state["clip_path"] = clip_path
+@st.fragment(run_every=3)
+def show_analysis_progress():
+    """Pollt alle 3s ob der Worker fertig ist. UI bleibt voll responsiv."""
+    result_path = Path(st.session_state.get("analysis_result_path", ""))
 
-        # JSON summary
-        json_path = clip_path.with_suffix(".json")
-        with open(json_path, "w") as f:
-            json.dump(result["summary"], f, indent=2)
+    st.subheader("Analysiere Video...")
+    st.caption("YOLOv8m-Pose verarbeitet Frames im Hintergrund")
 
+    done_marker = Path(str(result_path) + ".done")
+    if not done_marker.exists() and not result_path.exists():
+        # Laeuft noch
+        st.progress(0.4, text="Frame-Erkennung und Metrik-Berechnung...")
+        st.info("""
+        **Status:** Worker lauft im separaten Prozess
+        - Keypoint-Extraktion pro Frame
+        - Metrik-Berechnung (9 Metriken)
+        - UI bleibt wahrenddessen voll nutzbar
+        """)
+        st.markdown("<p style='color:#8b949e; font-size:12px;'>Polling alle 3s - automatische Umschaltung bei Fertigstellung</p>", unsafe_allow_html=True)
+        return
+
+    if result_path.exists():
+        with open(result_path) as f:
+            data = json.load(f)
+
+        if "error" in data:
+            st.error(f"Analyse fehlgeschlagen: {data['error']}")
+            st.code(data.get("traceback", ""))
+            st.session_state["analysis_running"] = False
+            return
+
+        st.success("Analyse abgeschlossen! Lade Live-Player...")
+        st.session_state["result"] = data
+        st.session_state["clip_path"] = result_path.parent / f"fencing_clip_{Path(str(result_path)).stem.split('_')[-1]}.mp4"
+        st.session_state["analysis_running"] = False
         st.rerun()
-    except Exception as e:
-        status.update(state="error")
-        st.error(f"Analyse fehlgeschlagen: {e}")
-        import traceback
-        st.code(traceback.format_exc())
 
 
 def display_player(result, clip_path):
@@ -1095,6 +1118,69 @@ def display_player(result, clip_path):
         html_content = build_live_player_html(result, clip_path, mode="embed")
     
     st_html(html_content, height=950, scrolling=False)
+
+
+def display_video_viewer():
+    """Zeigt Video-Player mit dualem Slider (Start/Ende) und Analysieren-Button - alles native Streamlit."""
+    vp = st.session_state["video_path"]
+    dur = st.session_state["vid_dur"]
+    fps = st.session_state["vid_fps"]
+    name = st.session_state["vid_name"]
+
+    st.subheader(f"\U0001F3AC {name}")
+
+    # Native Streamlit Video-Komponente
+    vid_data = open(vp, "rb").read()
+    st.video(vid_data, start_time=0)
+
+    # Timeline-Bereichsauswahl als native Streamlit-UI
+    st.markdown("<hr style='border-color:#30363d; margin:6px 0;'>", unsafe_allow_html=True)
+
+    col_s, col_e = st.columns([1, 1])
+    with col_s:
+        start_val = st.number_input(
+            "Start (Sekunden)",
+            min_value=0.0,
+            max_value=dur,
+            value=0.0,
+            step=0.5,
+            key="vid_start_inp",
+            format="%.1f"
+        )
+    with col_e:
+        end_val = st.number_input(
+            "Ende (Sekunden)",
+            min_value=0.0,
+            max_value=dur,
+            value=min(30.0, dur),
+            step=0.5,
+            key="vid_end_inp",
+            format="%.1f"
+        )
+
+    # Korrektur falls Start > Ende
+    if start_val > end_val:
+        start_val, end_val = end_val, start_val
+
+    clip_dur = end_val - start_val
+    clip_frames = int(clip_dur * fps)
+
+    # Info-Bereich mit 4 Metriken nebeneinander
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Start", f"{start_val:.1f}s")
+    c2.metric("Ende", f"{end_val:.1f}s")
+    c3.metric("Dauer", f"{clip_dur:.1f}s")
+    c4.metric("Frames", f"{clip_frames}")
+
+    st.markdown(f"<p style='color:#8b949e; font-size:13px;'>Gesamt: {dur:.0f}s @ {fps:.0f}fps</p>", unsafe_allow_html=True)
+
+    # Analysieren-Button
+    if clip_dur >= 3:
+        if st.button("\U0001F3AF Bereich analysieren", type="primary", use_container_width=True):
+            run_analysis(st.session_state["video_path"], start_val, clip_dur)
+    else:
+        st.warning("Bereich muss mindestens 3s lang sein")
+        st.button("\U0001F3AF Bereich analysieren", disabled=True, use_container_width=True)
 
 
 if __name__ == "__main__":
