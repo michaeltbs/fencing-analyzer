@@ -969,22 +969,38 @@ def main():
 
         if video_path:
             st.divider()
-            st.header("Clip-Einstellungen")
-            start_sec = st.number_input("Startzeit (s)", min_value=0, value=0, step=5)
-            clip_duration = st.number_input("Dauer (s)", min_value=5, value=15, max_value=900, step=5,
-                                           help="Maximal 15 Minuten (900s)")
+            st.header("Analyse-Zeitraum")
+            
             cap = cv2.VideoCapture(str(video_path))
             total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
             cap.release()
             vid_dur = total_f / vid_fps if vid_fps > 0 else 0
-            st.caption(f"{total_f} Frames @ {vid_fps:.0f}fps = {vid_dur:.0f}s Gesamt")
-            analyze_btn = st.button("Analyse starten", type="primary", use_container_width=True)
+            
+            st.caption(f"📹 {total_f} Frames @ {vid_fps:.0f}fps = {vid_dur:.0f}s Gesamt")
+            
+            # Zwei Slider als Timeline: Start und Ende
+            col_a, col_b = st.columns(2)
+            with col_a:
+                clip_start = st.number_input("Start (s)", min_value=0, max_value=int(vid_dur), 
+                                            value=0, step=5)
+            with col_b:
+                clip_end = st.number_input("Ende (s)", min_value=1, max_value=int(vid_dur),
+                                          value=min(30, int(vid_dur)), step=5)
+            
+            if clip_end <= clip_start:
+                st.warning("Ende muss nach Start liegen")
+                clip_duration = 0
+                analyze_btn = False
+            else:
+                clip_duration = clip_end - clip_start
+                st.caption(f"📊 Dauer: {clip_duration}s — ca. {int(clip_duration * vid_fps)} Frames")
+                analyze_btn = st.button("Analyse starten", type="primary", use_container_width=True)
         else:
             analyze_btn = False
 
     if video_path and analyze_btn:
-        run_analysis(video_path, start_sec, clip_duration)
+        run_analysis(video_path, clip_start, clip_duration)
     elif "result" in st.session_state:
         display_player(st.session_state["result"], st.session_state["clip_path"])
     else:
