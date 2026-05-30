@@ -185,18 +185,19 @@ try:
         m2_m_angle.append({"t": t, "deg": m_angle} if m_angle else {"t": t, "deg": 0})
         m2_g_angle.append({"t": t, "deg": g_angle} if g_angle else {"t": t, "deg": 0})
 
-        # M3 Lunge-Tiefe
+        # M3 Lunge-Tiefe (Differenz Hüfte zu vorderem Knöchel)
         def lunge_depth(kpts, prev_kpts):
             if kpts is None or prev_kpts is None:
                 return None
-            k_l = get_kp(kpts, 13)
-            k_r = get_kp(kpts, 14)
-            pk_l = get_kp(prev_kpts, 13)
-            pk_r = get_kp(prev_kpts, 14)
-            if k_l and pk_l:
-                return round(math.hypot(k_l[0] - pk_l[0], k_l[1] - pk_l[1]), 1)
-            if k_r and pk_r:
-                return round(math.hypot(k_r[0] - pk_r[0], k_r[1] - pk_r[1]), 1)
+            k_l = get_kp(kpts, 15)  # linker Knöchel
+            k_r = get_kp(kpts, 16)  # rechter Knöchel
+            if not k_l or not k_r:
+                return None
+            # Vorderer Fuss ist der weiter vorne (niedrigerer y-Wert = naher an Kamera unten)
+            front = k_l if k_l[1] > k_r[1] else k_r
+            hip = get_mid(kpts, 11, 12)
+            if hip:
+                return max(0, round(hip[1] - front[1], 1))  # vertikaler Abstand
             return None
 
         if frame_idx > 0:
@@ -217,17 +218,22 @@ try:
         m4_m_path.append({"t": t, "x": m_hip[0] if m_hip else 0, "y": m_hip[1] if m_hip else 0})
         m4_g_path.append({"t": t, "x": g_hip[0] if g_hip else 0, "y": g_hip[1] if g_hip else 0})
 
-        # M5 Korperhaltung
+        # M5 Korperhaltung (Winkel der Wirbelsaule relativ zur Senkrechten)
         def body_tilt(kpts):
-            neck = get_kp(kpts, 5) or get_kp(kpts, 6)
-            hip = get_mid(kpts, 11, 12)
+            neck = get_mid(kpts, 5, 6)  # midpoint of shoulders
+            hip = get_mid(kpts, 11, 12)  # midpoint of hips
             if neck and hip:
-                angle = math.degrees(math.atan2(hip[1] - neck[1], hip[0] - neck[0]))
-                return round(angle, 1)
+                dx = neck[0] - hip[0]
+                dy = neck[1] - hip[1]
+                # Winkel gegen die Senkrechte: 0° = aufrecht, >0 = nach vorne geneigt
+                angle = math.degrees(math.atan2(abs(dx), abs(dy))) if dy != 0 else 0
+                # Vorzeichen: positiv = Oberkorper vorgebeugt (Richtung Gegner)
+                sign = -1 if dx < 0 else 1
+                return round(angle * sign, 1)
             return 0
 
-        m5_m_tilt.append({"t": t, "deg": 0})
-        m5_g_tilt.append({"t": t, "deg": 0})
+        m5_m_tilt.append({"t": t, "deg": body_tilt(mk) if mk else 0})
+        m5_g_tilt.append({"t": t, "deg": body_tilt(gk) if gk else 0})
 
         # M6 Beschleunigung
         if prev_m_hip and m_hip:

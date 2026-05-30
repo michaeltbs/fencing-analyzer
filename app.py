@@ -1160,9 +1160,22 @@ def display_video_viewer():
 
     st.subheader(f"\U0001F3AC {name}")
 
-    # Native Streamlit Video-Komponente
-    vid_data = open(vp, "rb").read()
-    st.video(vid_data, start_time=0)
+    # Lade Video via ffmpeg in einen temp buffer statt gesamte Datei in RAM
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        subprocess.run([
+            str(Path.home() / "AppData/Local/hermes/hermes-agent/venv/Scripts/ffmpeg.exe"),
+            "-i", str(vp), "-ss", "0", "-t", "30",
+            "-vf", "scale=480:-2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
+            "-y", tmp.name
+        ], capture_output=True, timeout=30)
+        preview_path = tmp.name
+    try:
+        with open(preview_path, "rb") as f:
+            vid_data = f.read()
+        st.video(vid_data, start_time=0)
+    finally:
+        Path(preview_path).unlink(missing_ok=True)
 
     # Timeline-Bereichsauswahl als native Streamlit-UI
     st.markdown("<hr style='border-color:#30363d; margin:6px 0;'>", unsafe_allow_html=True)
