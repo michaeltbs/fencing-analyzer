@@ -635,7 +635,7 @@ input[type="range"]::-moz-range-thumb {{ width:16px; height:16px; border-radius:
 <body>
 
 <div class="player-wrapper">
-  <video id="vid" preload="auto" playsinline>
+  <video id="vid" preload="auto" playsinline controls muted autoplay>
     {video_src_block}
   </video>
   <canvas id="overlay"></canvas>

@@ -146,7 +146,7 @@ try:
 
     prev_m_hip, prev_g_hip = None, None
     m_step_active, g_step_active = False, False
-    step_counter_m, step_counter_g = 0, []
+    step_counter_m, step_counter_g = 0, 0
     step_times_m, step_times_g = [], []
 
     for f in frame_data:
