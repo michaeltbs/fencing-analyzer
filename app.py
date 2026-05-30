@@ -1039,7 +1039,6 @@ def display_player(result, clip_path):
     s = result["summary"]
 
     # 1. Media-Server starten (serviert Video + Player HTML + Daten)
-    s = result["summary"]
     metrics_payload = {
         "dist": [d["cm"] for d in result["m1_dist"]],
         "m_angle": [d["deg"] for d in result["m2_m_angle"]],
@@ -1054,6 +1053,18 @@ def display_player(result, clip_path):
         "g_vel": result["m8_vel_g"],
         "m_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_m_path"]],
         "g_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_g_path"]],
+        # Neue Metriken 9-15
+        "m_hand_h": [d["px"] for d in result["m9_m_hand_h"]],
+        "g_hand_h": [d["px"] for d in result["m9_g_hand_h"]],
+        "m_ext": [d["px"] for d in result["m10_m_ext"]],
+        "g_ext": [d["px"] for d in result["m10_g_ext"]],
+        "m_stance": [d["px"] for d in result["m11_m_stance"]],
+        "g_stance": [d["px"] for d in result["m11_g_stance"]],
+        "expl": [d["cm_s"] for d in result["m12_expl"]],
+        "m_head": [d["px"] for d in result["m13_m_head"]],
+        "g_head": [d["px"] for d in result["m13_g_head"]],
+        "touches": result["m14_touches"],
+        "rhythm": result["m15_rhythm"],
     }
     player_html = build_live_player_html(result, clip_path, mode="server")
     base_url = start_media_server(clip_path, result["frame_data"], metrics_payload, None)
@@ -1062,12 +1073,18 @@ def display_player(result, clip_path):
         "const MEDIA_BASE = '" + base_url + "';"
     )
 
-    # 2. Player-Button + Summary
+    # 2. Player-Button + Summary (2 rows)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Distanz ⌀", f'{s.get("dist_avg", 0):.0f} cm')
     col2.metric("Winkel M/G", f'{s.get("m_angle_avg", 0):.0f}° / {s.get("g_angle_avg", 0):.0f}°')
     col3.metric("Schritte M/G", f'{s.get("m_steps", 0)} / {s.get("g_steps", 0)}')
     col4.metric("Korrelation", f'{s.get("correlation", 0):.2f}')
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Handhöhe M/G", f'{s.get("m_hand_h_avg", 0):.0f} / {s.get("g_hand_h_avg", 0):.0f} px')
+    col6.metric("Arm-Streck M/G", f'{s.get("m_ext_avg", 0):.0f} / {s.get("g_ext_avg", 0):.0f} px')
+    col7.metric("Standbreite M/G", f'{s.get("m_stance_avg", 0):.0f} / {s.get("g_stance_avg", 0):.0f} px')
+    col8.metric("Touchés", f'{s.get("touches", 0)} ({s.get("touches_high", 0)} high)')
 
     st.markdown(
         f'<a href="{base_url}/player" target="_blank">'
@@ -1150,6 +1167,54 @@ def display_player(result, clip_path):
         fig.update_yaxes(fixedrange=True)
         st.plotly_chart(fig, use_container_width=True)
 
+    # Row 4: M9 Handhöhe, M10 Arm-Streckung, M11 Standbreite
+    c10, c11, c12 = st.columns(3)
+    with c10:
+        m_hh = [d["px"] for d in result["m9_m_hand_h"]]
+        st.plotly_chart(make_plotly("Handhöhe M", m_hh, C_GREEN, "px"), use_container_width=True)
+    with c11:
+        m_ext = [d["px"] for d in result["m10_m_ext"]]
+        st.plotly_chart(make_plotly("Arm-Streck M", m_ext, C_GREEN, "px"), use_container_width=True)
+    with c12:
+        m_stance = [d["px"] for d in result["m11_m_stance"]]
+        st.plotly_chart(make_plotly("Standbreite M", m_stance, C_GREEN, "px"), use_container_width=True)
+
+    # Row 5: M12 Explosivität, M13 Head-Forward, M15 Rhythmus
+    c13, c14, c15 = st.columns(3)
+    with c13:
+        expl = [d["cm_s"] for d in result["m12_expl"]]
+        expl_times = [d["t"] for d in result["m12_expl"]]
+        st.plotly_chart(make_plotly("Explosivität", expl, C_ACCENT, "cm/s"), use_container_width=True)
+    with c14:
+        m_head = [d["px"] for d in result["m13_m_head"]]
+        st.plotly_chart(make_plotly("Head Fwd M", m_head, C_GREEN, "px"), use_container_width=True)
+    with c15:
+        if result["m15_rhythm"]:
+            rhy_t = [r["t"] for r in result["m15_rhythm"]]
+            rhy_f = [r["freq_hz"] for r in result["m15_rhythm"]]
+            st.plotly_chart(make_plotly("Rhythmus Hz", rhy_f, "#ffaa00", "Hz"), use_container_width=True)
+        else:
+            st.caption("Rhythmus: zu wenig Daten")
+
+    # Row 6: Touché-Timeline
+    if result["m14_touches"]:
+        st.markdown("---")
+        st.subheader("🎯 Touché-Kandidaten")
+        touch_data = []
+        for t in result["m14_touches"]:
+            who_emoji = "🟢" if t["who"] == "Michael" else "🔴" if t["who"] == "Gegner" else "🟡"
+            conf_badge = "✅" if t["confidence"] == "high" else "⚠️"
+            touch_data.append({
+                "Zeit": f'{t["t"]:.1f}s',
+                "Wer": f'{who_emoji} {t["who"]}',
+                "Conf": conf_badge,
+                "Distanz": f'{t["dist_cm"]:.0f} cm',
+                "Ext M": f'{t["ext_m"]:.0f} px',
+                "Ext G": f'{t["ext_g"]:.0f} px',
+                "Löst sich": "✓" if t["resolves"] else "✗",
+            })
+        st.dataframe(touch_data, use_container_width=True, hide_index=True)
+
 
 def display_video_viewer():
     """Zeigt Video-Player mit dualem Slider (Start/Ende) und Analysieren-Button - alles native Streamlit."""
@@ -1160,16 +1225,17 @@ def display_video_viewer():
 
     st.subheader(f"\U0001F3AC {name}")
 
-    # Lade Video via ffmpeg in einen temp buffer statt gesamte Datei in RAM
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        subprocess.run([
-            str(Path.home() / "AppData/Local/hermes/hermes-agent/venv/Scripts/ffmpeg.exe"),
-            "-i", str(vp), "-ss", "0", "-t", "30",
-            "-vf", "scale=480:-2",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
-            "-y", tmp.name
-        ], capture_output=True, timeout=30)
-        preview_path = tmp.name
+    # Erstelle komprimierten Preview-Proxy (volle Länge, 480px, ~2-15 MB je nach Dauer)
+    preview_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    preview_path = preview_tmp.name
+    preview_tmp.close()
+    subprocess.run([
+        str(Path.home() / "AppData/Local/hermes/hermes-agent/venv/Scripts/ffmpeg.exe"),
+        "-i", str(vp),
+        "-vf", "scale=480:-2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-an",
+        "-y", preview_path
+    ], capture_output=True, timeout=300)
     try:
         with open(preview_path, "rb") as f:
             vid_data = f.read()

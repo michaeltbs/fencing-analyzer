@@ -4,8 +4,11 @@ Aufruf: python worker_analyze.py <clip_path> <result_path>
 
 Schreibt Ergebnis-JSON nach result_path. frame_data wird auf [t, m_kpts, g_kpts]
 komprimiert (keine numpy Objekte).
+
+Metriken: 1-8 (Basis) + 9-15 (Neu: Handhöhe, Arm-Streckung, Standbreite,
+Distanz-Explosivität, Head-Forward, Treffer-Kandidat, Rhythmus-Pattern)
 """
-import sys, json, math, traceback
+import sys, json, math, traceback, struct
 from pathlib import Path
 
 clip_path = Path(sys.argv[1])
@@ -134,7 +137,7 @@ try:
             return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
         return a or b or None
 
-    # Metriken berechnen
+    # === Metriken berechnen ===
     m1_dist = []
     m2_m_angle, m2_g_angle = [], []
     m3_m_lunge, m3_g_lunge = [], []
@@ -144,10 +147,20 @@ try:
     m7_m_steps, m7_g_steps = [], []
     m8_vel_m, m8_vel_g = [], []
 
+    # Neue Metriken 9-13 (in-loop), 12+14+15 (post-loop)
+    m9_m_hand_h, m9_g_hand_h = [], []
+    m10_m_ext, m10_g_ext = [], []
+    m11_m_stance, m11_g_stance = [], []
+    m13_m_head, m13_g_head = [], []
+
     prev_m_hip, prev_g_hip = None, None
     m_step_active, g_step_active = False, False
     step_counter_m, step_counter_g = 0, 0
     step_times_m, step_times_g = [], []
+
+    # Für Treffer-Kandidaten (Post-Loop)
+    m_ext_max, g_ext_max = 0, 0
+    m_ext_series, g_ext_series = [], []
 
     for f in frame_data:
         t = f["t"]
@@ -156,7 +169,7 @@ try:
         m_hip = get_mid(mk, 11, 12)
         g_hip = get_mid(gk, 11, 12)
 
-        # M1 Distanz - IMMER einen Dict-Eintrag liefern, nie None
+        # --- M1 Distanz ---
         if m_hip and g_hip:
             d_px = math.hypot(m_hip[0] - g_hip[0], m_hip[1] - g_hip[1])
             cm_val = round(d_px / px_per_cm, 1) if px_per_cm > 0 else 0
@@ -164,7 +177,7 @@ try:
         else:
             m1_dist.append({"t": t, "px": 0, "cm": 0})
 
-        # M2 Waffenarm-Winkel
+        # --- M2 Waffenarm-Winkel ---
         def arm_angle(kpts, side="right"):
             shoulder = get_kp(kpts, 6 if side == "right" else 5)
             elbow = get_kp(kpts, 8 if side == "right" else 7)
@@ -185,19 +198,18 @@ try:
         m2_m_angle.append({"t": t, "deg": m_angle} if m_angle else {"t": t, "deg": 0})
         m2_g_angle.append({"t": t, "deg": g_angle} if g_angle else {"t": t, "deg": 0})
 
-        # M3 Lunge-Tiefe (Differenz Hüfte zu vorderem Knöchel)
+        # --- M3 Lunge-Tiefe ---
         def lunge_depth(kpts, prev_kpts):
             if kpts is None or prev_kpts is None:
                 return None
-            k_l = get_kp(kpts, 15)  # linker Knöchel
-            k_r = get_kp(kpts, 16)  # rechter Knöchel
+            k_l = get_kp(kpts, 15)
+            k_r = get_kp(kpts, 16)
             if not k_l or not k_r:
                 return None
-            # Vorderer Fuss ist der weiter vorne (niedrigerer y-Wert = naher an Kamera unten)
             front = k_l if k_l[1] > k_r[1] else k_r
             hip = get_mid(kpts, 11, 12)
             if hip:
-                return max(0, round(hip[1] - front[1], 1))  # vertikaler Abstand
+                return max(0, round(hip[1] - front[1], 1))
             return None
 
         if frame_idx > 0:
@@ -214,20 +226,18 @@ try:
             m3_m_lunge.append({"t": t, "px": 0})
             m3_g_lunge.append({"t": t, "px": 0})
 
-        # M4 Bewegungs-Pfad
+        # --- M4 Bewegungs-Pfad ---
         m4_m_path.append({"t": t, "x": m_hip[0] if m_hip else 0, "y": m_hip[1] if m_hip else 0})
         m4_g_path.append({"t": t, "x": g_hip[0] if g_hip else 0, "y": g_hip[1] if g_hip else 0})
 
-        # M5 Korperhaltung (Winkel der Wirbelsaule relativ zur Senkrechten)
+        # --- M5 Korperhaltung ---
         def body_tilt(kpts):
-            neck = get_mid(kpts, 5, 6)  # midpoint of shoulders
-            hip = get_mid(kpts, 11, 12)  # midpoint of hips
+            neck = get_mid(kpts, 5, 6)
+            hip = get_mid(kpts, 11, 12)
             if neck and hip:
                 dx = neck[0] - hip[0]
                 dy = neck[1] - hip[1]
-                # Winkel gegen die Senkrechte: 0° = aufrecht, >0 = nach vorne geneigt
                 angle = math.degrees(math.atan2(abs(dx), abs(dy))) if dy != 0 else 0
-                # Vorzeichen: positiv = Oberkorper vorgebeugt (Richtung Gegner)
                 sign = -1 if dx < 0 else 1
                 return round(angle * sign, 1)
             return 0
@@ -235,7 +245,7 @@ try:
         m5_m_tilt.append({"t": t, "deg": body_tilt(mk) if mk else 0})
         m5_g_tilt.append({"t": t, "deg": body_tilt(gk) if gk else 0})
 
-        # M6 Beschleunigung
+        # --- M6 Beschleunigung + M8 Geschwindigkeit ---
         if prev_m_hip and m_hip:
             vel_m = math.hypot(m_hip[0] - prev_m_hip[0], m_hip[1] - prev_m_hip[1])
             m8_vel_m.append(vel_m)
@@ -256,7 +266,7 @@ try:
         else:
             m6_g_acc.append({"t": t, "acc": 0})
 
-        # M7 Schritt-Rhythmus
+        # --- M7 Schritt-Rhythmus ---
         def detect_step(kpts, prev_kpts, active):
             if kpts is None or prev_kpts is None:
                 return False, active
@@ -289,11 +299,56 @@ try:
             m7_m_steps.append({"t": t, "step": 0})
             m7_g_steps.append({"t": t, "step": 0})
 
+        # --- M9: Waffenhand-Höhe (relativ zu Schulter, negativ = Hand unter Schulter) ---
+        def hand_height(kpts):
+            sh = get_kp(kpts, 6) or get_kp(kpts, 5)  # rechte Schulter, fallback linke
+            wr = get_kp(kpts, 10) or get_kp(kpts, 9)  # rechtes Handgelenk, fallback linkes
+            if sh and wr:
+                return round(sh[1] - wr[1], 1)  # positiv = Hand über Schulter (hohe Guard)
+            return 0
+        m9_m_hand_h.append({"t": t, "px": hand_height(mk) if mk else 0})
+        m9_g_hand_h.append({"t": t, "px": hand_height(gk) if gk else 0})
+
+        # --- M10: Arm-Streckung (Schulter→Handgelenk Distanz) ---
+        def arm_extension(kpts):
+            sh = get_kp(kpts, 6) or get_kp(kpts, 5)
+            wr = get_kp(kpts, 10) or get_kp(kpts, 9)
+            if sh and wr:
+                return round(math.hypot(wr[0]-sh[0], wr[1]-sh[1]), 1)
+            return 0
+        ext_m = arm_extension(mk) if mk else 0
+        ext_g = arm_extension(gk) if gk else 0
+        m10_m_ext.append({"t": t, "px": ext_m})
+        m10_g_ext.append({"t": t, "px": ext_g})
+        m_ext_series.append(ext_m)
+        g_ext_series.append(ext_g)
+        m_ext_max = max(m_ext_max, ext_m)
+        g_ext_max = max(g_ext_max, ext_g)
+
+        # --- M11: Standbreite (Knöchel-Distanz) ---
+        def stance_width(kpts):
+            la = get_kp(kpts, 15)
+            ra = get_kp(kpts, 16)
+            if la and ra:
+                return round(math.hypot(ra[0]-la[0], ra[1]-la[1]), 1)
+            return 0
+        m11_m_stance.append({"t": t, "px": stance_width(mk) if mk else 0})
+        m11_g_stance.append({"t": t, "px": stance_width(gk) if gk else 0})
+
+        # --- M13: Head-Forward-Index (Nase.x − Hüftmitte.x, positiv = Kopf vor Körper) ---
+        def head_forward(kpts):
+            nose = get_kp(kpts, 0)
+            hip = get_mid(kpts, 11, 12)
+            if nose and hip:
+                return round(nose[0] - hip[0], 1)
+            return 0
+        m13_m_head.append({"t": t, "px": head_forward(mk) if mk else 0})
+        m13_g_head.append({"t": t, "px": head_forward(gk) if gk else 0})
+
         prev_m_hip = m_hip
         prev_g_hip = g_hip
-        frame_idx += 1
 
-    # M8 Synchronisierung
+    # === M8 Synchronisierung (Post-Loop) ===
     vel_m_arr = [v for v in m8_vel_m] if m8_vel_m else [0]
     vel_g_arr = [v for v in m8_vel_g] if m8_vel_g else [0]
     min_len = min(len(vel_m_arr), len(vel_g_arr))
@@ -307,7 +362,74 @@ try:
         lag_val = int(np.argmax(corr) - (min_len - 1))
         corr_val = float(np.max(corr))
 
-    # Summary
+    # === M12: Distanz-Explosivität (erste Ableitung von Distanz) ===
+    m12_expl = []
+    for i in range(1, len(m1_dist)):
+        dd = abs(m1_dist[i]["cm"] - m1_dist[i-1]["cm"])
+        dt = m1_dist[i]["t"] - m1_dist[i-1]["t"]
+        if dt > 0:
+            m12_expl.append({"t": m1_dist[i]["t"], "cm_s": round(dd/dt, 1)})
+        else:
+            m12_expl.append({"t": m1_dist[i]["t"], "cm_s": 0})
+
+    # === M14: Treffer-Kandidaten (Arm-Streckung >80% max AND Distanz <30%-Perzentil) ===
+    dist_cm = [d["cm"] for d in m1_dist if d["cm"] > 0]
+    dist_p30 = float(np.percentile(dist_cm, 30)) if dist_cm else 0
+    m14_touches = []
+    for i in range(1, len(m1_dist)):
+        ext_m = m10_m_ext[i]["px"] if i < len(m10_m_ext) else 0
+        ext_g = m10_g_ext[i]["px"] if i < len(m10_g_ext) else 0
+        d_val = m1_dist[i]["cm"]
+        t_val = m1_dist[i]["t"]
+
+        # Kriterium: Arm fast voll gestreckt AND beide nah beieinander
+        m_candidate = ext_m > 0.8 * m_ext_max and m_ext_max > 10 and d_val < dist_p30
+        g_candidate = ext_g > 0.8 * g_ext_max and g_ext_max > 10 and d_val < dist_p30
+
+        if m_candidate or g_candidate:
+            who = "Michael" if m_candidate else "Gegner"
+            if g_candidate and m_candidate:
+                who = "beide"
+            # Prüfe: löst sich danach auf (Distanz steigt)?
+            future_dist = [m1_dist[j]["cm"] for j in range(i, min(i+5, len(m1_dist))) if m1_dist[j]["cm"] > 0]
+            resolves = any(fd > d_val * 1.15 for fd in future_dist) if future_dist else False
+            m14_touches.append({
+                "t": t_val,
+                "who": who,
+                "ext_m": ext_m,
+                "ext_g": ext_g,
+                "dist_cm": d_val,
+                "resolves": resolves,
+                "confidence": "high" if resolves else "medium",
+            })
+
+    # === M15: Rhythmus-Pattern (FFT über Distanz, 5s-Fenster) ===
+    m15_rhythm = []
+    window_s = 5.0
+    window_frames = int(window_s * fps)
+    dist_arr = np.array(dist_cm) if dist_cm else np.array([0])
+
+    for i in range(0, len(dist_arr), int(fps * 0.5)):  # alle 0.5s
+        win = dist_arr[i:i+window_frames]
+        if len(win) < window_frames // 2:
+            break
+        win_centered = win - np.mean(win)
+        fft = np.abs(np.fft.rfft(win_centered))
+        freqs = np.fft.rfftfreq(len(win), d=1.0/fps)
+        # Nur relevante Fecht-Frequenzen (0.3-4 Hz)
+        mask = (freqs >= 0.3) & (freqs <= 4.0)
+        if mask.sum() > 0:
+            peak_idx = int(np.argmax(fft[mask]))
+            peak_freq = freqs[mask][peak_idx]
+            peak_power = fft[mask][peak_idx]
+            t_center = i / fps
+            m15_rhythm.append({
+                "t": round(t_center, 1),
+                "freq_hz": round(peak_freq, 2),
+                "power": round(float(peak_power), 1),
+            })
+
+    # === Summary ===
     sum_m1 = [d for d in m1_dist if d and d.get("cm")]
     summary = {
         "duration": round(duration, 1),
@@ -335,6 +457,18 @@ try:
         "correlation": round(corr_val, 3),
         "lag_frames": lag_val,
         "lag_seconds": round(lag_val / fps, 2) if fps > 0 else 0,
+        # Neue Summaries
+        "m_hand_h_avg": round(sum(d["px"] for d in m9_m_hand_h) / max(N, 1), 1),
+        "g_hand_h_avg": round(sum(d["px"] for d in m9_g_hand_h) / max(N, 1), 1),
+        "m_ext_avg": round(sum(d["px"] for d in m10_m_ext) / max(N, 1), 1),
+        "g_ext_avg": round(sum(d["px"] for d in m10_g_ext) / max(N, 1), 1),
+        "m_stance_avg": round(sum(d["px"] for d in m11_m_stance) / max(N, 1), 1),
+        "g_stance_avg": round(sum(d["px"] for d in m11_g_stance) / max(N, 1), 1),
+        "expl_max": round(max(d["cm_s"] for d in m12_expl), 1) if m12_expl else 0,
+        "expl_avg": round(sum(d["cm_s"] for d in m12_expl) / max(len(m12_expl), 1), 1) if m12_expl else 0,
+        "touches": len(m14_touches),
+        "touches_high": len([t for t in m14_touches if t["confidence"] == "high"]),
+        "rhythm_dominant": round(max(r["freq_hz"] for r in m15_rhythm), 2) if m15_rhythm else 0,
     }
 
     result = {
@@ -355,6 +489,17 @@ try:
         "m7_g_steps": m7_g_steps,
         "m8_vel_m": m8_vel_m,
         "m8_vel_g": m8_vel_g,
+        "m9_m_hand_h": m9_m_hand_h,
+        "m9_g_hand_h": m9_g_hand_h,
+        "m10_m_ext": m10_m_ext,
+        "m10_g_ext": m10_g_ext,
+        "m11_m_stance": m11_m_stance,
+        "m11_g_stance": m11_g_stance,
+        "m12_expl": m12_expl,
+        "m13_m_head": m13_m_head,
+        "m13_g_head": m13_g_head,
+        "m14_touches": m14_touches,
+        "m15_rhythm": m15_rhythm,
     }
 
     with open(result_path, "w") as f:
