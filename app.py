@@ -39,10 +39,11 @@ _media_server = None
 _media_server_port = None
 
 class MediaRequestHandler(BaseHTTPRequestHandler):
-    """Serves video file with range support + JSON data for the live player."""
+    """Serves video file with range support + Player HTML page."""
     video_path = None
     frame_data_json = None
     metrics_json = None
+    player_html = None
     
     def do_GET(self):
         if self.path == "/video":
@@ -51,6 +52,8 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
             self._serve_json(MediaRequestHandler.frame_data_json, "application/json")
         elif self.path == "/metrics.json":
             self._serve_json(MediaRequestHandler.metrics_json, "application/json")
+        elif self.path == "/player" or self.path == "/":
+            self._serve_player()
         elif self.path == "/health":
             self.send_response(200)
             self.end_headers()
@@ -101,6 +104,21 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
     
+    def _serve_player(self):
+        if MediaRequestHandler.player_html is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        html = MediaRequestHandler.player_html
+        data_bytes = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data_bytes)
+    
     def _serve_json(self, data, mime):
         if data is None:
             self.send_response(404)
@@ -118,7 +136,7 @@ class MediaRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # suppress HTTP server logs
 
-def start_media_server(video_path, frame_data, metrics):
+def start_media_server(video_path, frame_data, metrics, player_html=None):
     """Startet Mini-HTTP-Server auf einem freien Port, gibt die URL zurück."""
     global _media_server, _media_server_port
     
@@ -128,6 +146,7 @@ def start_media_server(video_path, frame_data, metrics):
     MediaRequestHandler.video_path = Path(video_path)
     MediaRequestHandler.frame_data_json = json.dumps(frame_data)
     MediaRequestHandler.metrics_json = json.dumps(metrics)
+    MediaRequestHandler.player_html = player_html
     
     # Find free port
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -604,10 +623,9 @@ loadServerData();
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
 <title>Fecht-Analyzer Live</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ background:#0d1117; color:#c9d1d9; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; min-height:100vh; padding:12px; }}
+body {{ background:#0d1117; color:#c9d1d9; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; min-height:700px; padding:12px; }}
 .player-wrapper {{ max-width:960px; margin:0 auto; position:relative; background:#000; border-radius:10px; overflow:hidden; }}
 .player-wrapper video {{ width:100%; display:block; }}
 .player-wrapper canvas {{ position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }}
@@ -626,10 +644,6 @@ body {{ background:#0d1117; color:#c9d1d9; font-family:-apple-system,BlinkMacSys
 input[type="range"] {{ width:100%; height:6px; -webkit-appearance:none; appearance:none; background:#21262d; border-radius:3px; outline:none; }}
 input[type="range"]::-webkit-slider-thumb {{ -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:#58a6ff; cursor:pointer; border:2px solid #0d1117; }}
 input[type="range"]::-moz-range-thumb {{ width:16px; height:16px; border-radius:50%; background:#58a6ff; cursor:pointer; border:2px solid #0d1117; }}
-.charts-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }}
-.chart-cell {{ background:#161b22; border:1px solid #30363d; border-radius:6px; padding:6px; min-height:180px; }}
-.charts-title {{ font-size:14px; font-weight:600; color:#c9d1d9; margin:12px 0 4px; }}
-@media (max-width:700px) {{ .charts-grid {{ grid-template-columns:1fr; }} }}
 </style>
 </head>
 <body>
@@ -660,9 +674,6 @@ input[type="range"]::-moz-range-thumb {{ width:16px; height:16px; border-radius:
   <div class="stat"><div class="val" id="statSteps">0</div><div class="lbl">Schritte</div></div>
   <div class="stat"><div class="val" id="statAcc">-</div><div class="lbl">Max Beschl</div></div>
 </div>
-
-<div class="charts-title">📊 Metriken</div>
-<div class="charts-grid" id="chartsGrid"></div>
 
 <script>
 // ===== DATA =====
@@ -705,12 +716,8 @@ const SKEL = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,1
 // ===== DRAW FRAME =====
 function drawFrame() {{
   const t = vid.currentTime;
-  // Find nearest frame
-  let fi = 0;
-  for (let i = 0; i < FRAMES.length; i++) {{
-    if (FRAMES[i].t >= t) {{ fi = i; break; }}
-  }}
-  if (fi >= FRAMES.length) fi = FRAMES.length - 1;
+  // O(1) Frame-Suche: direkt per Index
+  const fi = Math.min(Math.round(t * FPS), FRAMES.length - 1);
   const f = FRAMES[fi];
   if (!f) return;
 
@@ -807,22 +814,33 @@ function drawFrame() {{
   if (mHip && gHip) {{
     const d = Math.hypot(mHip[0]-gHip[0], mHip[1]-gHip[1]);
     document.getElementById('statDist').textContent = Math.round(d / 0.65) + 'cm';
+  }} else {{
+    document.getElementById('statDist').textContent = '- cm';
   }}
-  document.getElementById('statAngle').textContent = (M_ANGLE[fi] || 0).toFixed(0) + '/' + (G_ANGLE[fi] || 0).toFixed(0);
-  document.getElementById('statAcc').textContent = (M_ACC[fi-2] || 0).toFixed(0);
+  document.getElementById('statAngle').textContent = (M_ANGLE[fi] || 0).toFixed(0) + '° / ' + (G_ANGLE[fi] || 0).toFixed(0) + '°';
+  document.getElementById('statSteps').textContent = 'M=' + (M_STEPS ? M_STEPS[fi]?.step || 0 : 0) + ' G=' + (G_STEPS ? G_STEPS[fi]?.step || 0 : 0);
+  document.getElementById('statAcc').textContent = 'M=' + (M_ACC ? (M_ACC[fi]?.acc || 0).toFixed(0) : '0') + ' G=' + (G_ACC ? (G_ACC[fi]?.acc || 0).toFixed(0) : '0');
 }}
 
-// ===== TIME UPDATE =====
-let isSeeking = false;
+// ===== ANIMATION LOOP (requestAnimationFrame statt timeupdate fur flussiges Skelett) =====
+let rafRunning = false;
 
-vid.addEventListener('timeupdate', () => {{
-  document.getElementById('timeSlider').value = vid.currentTime;
-  document.getElementById('timeDisplay').textContent = formatTime(vid.currentTime) + ' / ' + formatTime(DURATION);
-  if (!isSeeking) drawFrame();
+function animationLoop() {{
+  if (vid.paused) {{ rafRunning = false; return; }}
+  const t = vid.currentTime;
+  document.getElementById('timeSlider').value = t;
+  document.getElementById('timeDisplay').textContent = formatTime(t) + ' / ' + formatTime(DURATION);
+  drawFrame();
+  requestAnimationFrame(animationLoop);
+}}
+
+vid.addEventListener('play', () => {{
+  if (!rafRunning) {{ rafRunning = true; requestAnimationFrame(animationLoop); }}
 }});
-
-vid.addEventListener('seeking', () => {{ isSeeking = true; drawFrame(); }});
-vid.addEventListener('seeked', () => {{ isSeeking = false; }});
+// Falls Autoplay ohne 'play'-Event startet
+setTimeout(() => {{
+  if (!vid.paused && !rafRunning) {{ rafRunning = true; requestAnimationFrame(animationLoop); }}
+}}, 500);
 
 // ===== SLIDER =====
 document.getElementById('timeSlider').addEventListener('input', (e) => {{
@@ -830,84 +848,12 @@ document.getElementById('timeSlider').addEventListener('input', (e) => {{
   vid.currentTime = t;
   document.getElementById('timeDisplay').textContent = formatTime(t) + ' / ' + formatTime(DURATION);
   drawFrame();
-  // Update chart vlines
-  chartTimes.forEach(cb => cb(t));
 }});
 
 function formatTime(s) {{
   const m = Math.floor(s/60), sec = Math.floor(s%60), ds = Math.floor((s%1)*10);
   return String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0') + '.' + ds;
 }}
-
-// ===== PLOTLY CHARTS =====
-const chartTimes = [];
-
-function makeChart(containerId, title, xData, yData, color, yTitle) {{
-  const steps = yData.length;
-  const times = Array.from({{length: steps}}, (_,i) => i * (DURATION / (steps-1 || 1)));
-  const trace = {{
-    x: times, y: yData, type: 'scatter', mode: 'lines',
-    line: {{color: color, width: 1.5}}, name: title,
-  }};
-  const layout = {{
-    title: {{text: title, font: {{size: 12, color: '#c9d1d9'}}, x: 0.02}},
-    paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
-    font: {{color: '#8b949e', size: 10}},
-    xaxis: {{gridcolor: '#21262d', showticklabels: false, showline: true, linecolor: '#30363d', zeroline: false}},
-    yaxis: {{gridcolor: '#21262d', title: yTitle || '', color: '#8b949e', showline: true, linecolor: '#30363d', zeroline: false}},
-    margin: {{l: 40, r: 10, t: 24, b: 20}},
-    hovermode: 'x unified',
-    dragmode: false,
-    shapes: [],
-    showlegend: false,
-  }};
-  const config = {{displayModeBar: false, responsive: true}};
-  Plotly.newPlot(containerId, [trace], layout, config);
-
-  // Click handler - jump video
-  document.getElementById(containerId).on('plotly_click', (data) => {{
-    if (data.points.length > 0) {{
-      const t = data.points[0].x;
-      vid.currentTime = t;
-      document.getElementById('timeSlider').value = t;
-      document.getElementById('timeDisplay').textContent = formatTime(t) + ' / ' + formatTime(DURATION);
-      drawFrame();
-    }}
-  }});
-
-  // VLine updater
-  const vlineUpdater = (t) => {{
-    const update = {{shapes: [{{
-      type: 'line', x0: t, x1: t, y0: 0, y1: 1, yref: 'paper',
-      line: {{color: '#58a6ff', width: 1.5, dash: 'dot'}}
-    }}]}};
-    Plotly.relayout(containerId, update);
-  }};
-  chartTimes.push(vlineUpdater);
-}}
-
-// Build charts grid
-const chartSpecs = [
-  ['ch1', 'Distanz', DIST_DATA, '#00ccff', 'cm'],
-  ['ch2', 'Winkel M', M_ANGLE, '#00ff88', '°'],
-  ['ch3', 'Winkel G', G_ANGLE, '#ff4466', '°'],
-  ['ch4', 'Haltung M', M_HALTUNG, '#00ff88', '°'],
-  ['ch5', 'Haltung G', G_HALTUNG, '#ff4466', '°'],
-  ['ch6', 'Beschl. M', M_ACC, '#00ff88', 'px/s²'],
-  ['ch7', 'Beschl. G', G_ACC, '#ff4466', 'px/s²'],
-  ['ch8', 'Sync M', M_VEL, '#00ff88', 'px/s'],
-  ['ch9', 'Sync G', G_VEL, '#ff4466', 'px/s'],
-];
-
-const grid = document.getElementById('chartsGrid');
-chartSpecs.forEach(([id, name, data, color, unit]) => {{
-  const cell = document.createElement('div');
-  cell.className = 'chart-cell';
-  cell.id = id;
-  grid.appendChild(cell);
-  // Delay rendering for perf
-  setTimeout(() => makeChart(id, name, null, data, color, unit), 10);
-}});
 
 // ===== INITIAL DRAW =====
 vid.addEventListener('loadedmetadata', () => {{
@@ -1089,35 +1035,120 @@ def show_analysis_progress():
 
 
 def display_player(result, clip_path):
-    """Render the live video player with canvas overlay and synced charts."""
-    clip_size_mb = clip_path.stat().st_size / (1024 * 1024)
-    
-    if clip_size_mb >= 30:
-        # Large video: start media server
-        s = result["summary"]
-        metrics_payload = {
-            "dist": [d["cm"] for d in result["m1_dist"]],
-            "m_angle": [d["deg"] for d in result["m2_m_angle"]],
-            "g_angle": [d["deg"] for d in result["m2_g_angle"]],
-            "m_haltung": [d["deg"] for d in result["m5_m_tilt"]],
-            "g_haltung": [d["deg"] for d in result["m5_g_tilt"]],
-            "m_acc": [d["acc"] for d in result["m6_m_acc"]],
-            "g_acc": [d["acc"] for d in result["m6_g_acc"]],
-            "m_steps": result["m7_m_steps"],
-            "g_steps": result["m7_g_steps"],
-            "m_vel": result["m8_vel_m"],
-            "g_vel": result["m8_vel_g"],
-            "m_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_m_path"]],
-            "g_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_g_path"]],
-        }
-        base_url = start_media_server(clip_path, result["frame_data"], metrics_payload)
-        html_content = build_live_player_html(result, clip_path, mode="server")
-        # Replace placeholder base URL
-        html_content = html_content.replace("const MEDIA_BASE = '';", f"const MEDIA_BASE = '{base_url}';")
-    else:
-        html_content = build_live_player_html(result, clip_path, mode="embed")
-    
-    st_html(html_content, height=950, scrolling=False)
+    """Zeigt Summary + Link zum Player (separater Tab) + native Plotly-Charts."""
+    s = result["summary"]
+
+    # 1. Media-Server starten (serviert Video + Player HTML + Daten)
+    s = result["summary"]
+    metrics_payload = {
+        "dist": [d["cm"] for d in result["m1_dist"]],
+        "m_angle": [d["deg"] for d in result["m2_m_angle"]],
+        "g_angle": [d["deg"] for d in result["m2_g_angle"]],
+        "m_haltung": [d["deg"] for d in result["m5_m_tilt"]],
+        "g_haltung": [d["deg"] for d in result["m5_g_tilt"]],
+        "m_acc": [d["acc"] for d in result["m6_m_acc"]],
+        "g_acc": [d["acc"] for d in result["m6_g_acc"]],
+        "m_steps": result["m7_m_steps"],
+        "g_steps": result["m7_g_steps"],
+        "m_vel": result["m8_vel_m"],
+        "g_vel": result["m8_vel_g"],
+        "m_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_m_path"]],
+        "g_path": [{"x": p["x"], "y": p["y"]} for p in result["m4_g_path"]],
+    }
+    player_html = build_live_player_html(result, clip_path, mode="server")
+    base_url = start_media_server(clip_path, result["frame_data"], metrics_payload, None)
+    MediaRequestHandler.player_html = player_html.replace(
+        "const MEDIA_BASE = '';",
+        "const MEDIA_BASE = '" + base_url + "';"
+    )
+
+    # 2. Player-Button + Summary
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Distanz ⌀", f'{s.get("dist_avg", 0):.0f} cm')
+    col2.metric("Winkel M/G", f'{s.get("m_angle_avg", 0):.0f}° / {s.get("g_angle_avg", 0):.0f}°')
+    col3.metric("Schritte M/G", f'{s.get("m_steps", 0)} / {s.get("g_steps", 0)}')
+    col4.metric("Korrelation", f'{s.get("correlation", 0):.2f}')
+
+    st.markdown(
+        f'<a href="{base_url}/player" target="_blank">'
+        f'<button style="width:100%;padding:14px;background:#238636;border:1px solid #2ea043;'
+        f'color:#fff;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;">'
+        f'▶ Player öffnen (neuer Tab)</button></a>',
+        unsafe_allow_html=True
+    )
+
+    # 3. CHARTS: 9 native Plotly-Charts in 3x3 Grid
+    st.markdown("---")
+    st.subheader("📊 Metriken")
+
+    N = len(result["m1_dist"])
+    times = [d["t"] for d in result["m1_dist"]]
+
+    # 3x3 grid with columns
+    def make_plotly(title, data, color, y_title, y_range=None):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times, y=data, mode="lines", line=dict(color=color, width=1.5), name=title, hovertemplate="%{y:.1f}"))
+        fig.update_layout(
+            title=dict(text=title, font=dict(size=12, color=C_TEXT), x=0.02),
+            paper_bgcolor=C_CARD, plot_bgcolor=C_CARD,
+            font=dict(color=C_MUTED, size=10),
+            xaxis=dict(gridcolor=C_BORDER, showticklabels=False, zeroline=False, showline=True, linecolor=C_BORDER),
+            yaxis=dict(gridcolor=C_BORDER, title=y_title, color=C_TEXT, zeroline=False, showline=True, linecolor=C_BORDER,
+                       range=y_range if y_range else None),
+            margin=dict(l=35, r=8, t=24, b=18),
+            hovermode="x unified",
+            showlegend=False,
+            height=140,
+        )
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+        return fig
+
+    c1, c2, c3 = st.columns(3)
+    dist_data = [d["cm"] for d in result["m1_dist"]]
+    with c1:
+        st.plotly_chart(make_plotly("Distanz", dist_data, C_BLUE, "cm", [0, max(dist_data)*1.15 or 200]), use_container_width=True)
+    with c2:
+        m_ang = [d["deg"] for d in result["m2_m_angle"]]
+        st.plotly_chart(make_plotly("Winkel M", m_ang, C_GREEN, "°", [0, 180]), use_container_width=True)
+    with c3:
+        g_ang = [d["deg"] for d in result["m2_g_angle"]]
+        st.plotly_chart(make_plotly("Winkel G", g_ang, C_RED, "°", [0, 180]), use_container_width=True)
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        m_halt = [d["deg"] for d in result["m5_m_tilt"]]
+        st.plotly_chart(make_plotly("Haltung M", m_halt, C_GREEN, "°"), use_container_width=True)
+    with c5:
+        g_halt = [d["deg"] for d in result["m5_g_tilt"]]
+        st.plotly_chart(make_plotly("Haltung G", g_halt, C_RED, "°"), use_container_width=True)
+    with c6:
+        m_lunge = [d["px"] for d in result["m3_m_lunge"]]
+        st.plotly_chart(make_plotly("Lunge M", m_lunge, C_GREEN, "px"), use_container_width=True)
+
+    c7, c8, c9 = st.columns(3)
+    with c7:
+        m_acc = [d["acc"] for d in result["m6_m_acc"]]
+        st.plotly_chart(make_plotly("Beschl. M", m_acc, C_GREEN, "px/s²"), use_container_width=True)
+    with c8:
+        g_acc = [d["acc"] for d in result["m6_g_acc"]]
+        st.plotly_chart(make_plotly("Beschl. G", g_acc, C_RED, "px/s²"), use_container_width=True)
+    with c9:
+        sync_m = result.get("m8_vel_m", [0])
+        sync_g = result.get("m8_vel_g", [0])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times[:len(sync_m)], y=sync_m, mode="lines", line=dict(color=C_GREEN, width=1), name="Michael", hovertemplate="%{y:.1f}"))
+        fig.add_trace(go.Scatter(x=times[:len(sync_g)], y=sync_g, mode="lines", line=dict(color=C_RED, width=1), name="Gegner", hovertemplate="%{y:.1f}"))
+        fig.update_layout(
+            title=dict(text="Sync M/G", font=dict(size=12, color=C_TEXT), x=0.02),
+            paper_bgcolor=C_CARD, plot_bgcolor=C_CARD, font=dict(color=C_MUTED, size=10),
+            xaxis=dict(gridcolor=C_BORDER, showticklabels=False, zeroline=False),
+            yaxis=dict(gridcolor=C_BORDER, title="px/s", color=C_TEXT, zeroline=False),
+            margin=dict(l=35, r=8, t=24, b=18), hovermode="x unified", showlegend=False, height=140,
+        )
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def display_video_viewer():
