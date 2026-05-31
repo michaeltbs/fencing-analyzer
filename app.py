@@ -871,6 +871,23 @@ if ('ontouchstart' in window) {{
     if (vid.paused) vid.play();
   }});
 }}
+
+// ===== KEYBOARD SHORTCUTS =====
+document.addEventListener('keydown', (e) => {{
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space') {{
+    e.preventDefault();
+    if (vid.paused) {{ vid.play(); }} else {{ vid.pause(); }}
+  }}
+  if (e.code === 'ArrowRight') {{
+    e.preventDefault();
+    vid.currentTime = Math.min(vid.currentTime + 1, DURATION);
+  }}
+  if (e.code === 'ArrowLeft') {{
+    e.preventDefault();
+    vid.currentTime = Math.max(vid.currentTime - 1, 0);
+  }}
+}});
 </script>
 </body>
 </html>"""
@@ -893,7 +910,17 @@ def main():
     """, unsafe_allow_html=True)
 
     st.title("🤺 Fecht-Analyzer")
-    st.caption("YOLOv8m-Pose | 9 Metriken | Live-Video-Player mit synchronisierten Charts")
+    
+    # GPU-Check
+    try:
+        import torch
+        gpu_available = torch.cuda.is_available()
+        gpu_name = torch.cuda.get_device_name(0) if gpu_available else ""
+    except:
+        gpu_available = False
+        gpu_name = ""
+    gpu_label = f"GPU: {gpu_name}" if gpu_available else "CPU (PyTorch)"
+    st.caption(f"YOLOv8m-Pose | 15 Metriken | Live-Video-Player | {gpu_label}")
 
     with st.sidebar:
         st.header("Video-Quelle")
@@ -941,6 +968,8 @@ def main():
 
     if st.session_state.get("analysis_running"):
         show_analysis_progress()
+    elif st.session_state.get("compare_mode"):
+        show_comparison()
     elif "result" in st.session_state:
         display_player(st.session_state["result"], st.session_state["clip_path"])
     elif "video_path" in st.session_state:
@@ -968,7 +997,7 @@ def main():
 WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker_analyze.py")
 
 
-def run_analysis(video_path, start_sec, clip_duration):
+def run_analysis(video_path, start_sec, clip_duration, label="Analyse"):
     """Extrahiere Clip + starte Worker-Subprocess. Fragment pollt Ergebnis-Datei."""
     clip_progress = st.progress(0, text="Extrahiere Clip...")
     timestamp = int(time.time())
@@ -999,6 +1028,7 @@ def run_analysis(video_path, start_sec, clip_duration):
     st.session_state["analysis_result_path"] = str(result_path)
     st.session_state["analysis_running"] = True
     st.session_state["analysis_start_time"] = start_time
+    st.session_state["analysis_label"] = label
     st.rerun()
 
 
@@ -1061,10 +1091,25 @@ def show_analysis_progress():
             st.session_state["analysis_running"] = False
             return
 
-        st.success("Analyse abgeschlossen! Lade Live-Player...")
-        st.session_state["result"] = data
-        st.session_state["clip_path"] = Path(str(result_path).replace("fencing_result_", "fencing_clip_").replace(".json", ".mp4"))
-        st.session_state["analysis_running"] = False
+        st.success("Analyse abgeschlossen! Lade Ergebnisse...")
+        if st.session_state.get("analyze_second"):
+            # This is the second analysis for comparison
+            label = st.session_state.get("analysis_label", "Bereich 2")
+            st.session_state["compare_results"] = [
+                st.session_state.get("compare_first", {}).get("result"),
+                data,
+            ]
+            st.session_state["compare_labels"] = [
+                st.session_state.get("compare_first", {}).get("label", "Bereich 1"),
+                label,
+            ]
+            st.session_state["compare_mode"] = True
+            st.session_state["analyze_second"] = False
+            st.session_state["analysis_running"] = False
+        else:
+            st.session_state["result"] = data
+            st.session_state["clip_path"] = Path(str(result_path).replace("fencing_result_", "fencing_clip_").replace(".json", ".mp4"))
+            st.session_state["analysis_running"] = False
         st.rerun()
 
 
@@ -1122,20 +1167,79 @@ def display_player(result, clip_path):
 
     # Report Button
     col_r1, col_r2 = st.columns([3, 1])
-    with col_r2:
-        if st.button("📄 Bundestrainer-Report (PDF)", type="primary", use_container_width=True):
-            with st.spinner("Generiere PDF..."):
-                try:
-                    vname = st.session_state.get("vid_name", "Gefecht").replace(".mp4", "")
-                    pdf_path, pdf_preview = generate_report(result, vname)
-                    st.success(f"PDF erstellt: {Path(pdf_path).name}")
-                    with open(pdf_path, "rb") as f:
-                        st.download_button("📥 PDF herunterladen", f.read(), file_name=Path(pdf_path).name, mime="application/pdf", use_container_width=True)
-                except Exception as e:
-                    st.error(f"PDF-Fehler: {e}")
     with col_r1:
-        markdown_preview = f"""**⌀ Distanz:** {s.get('dist_avg',0):.0f} cm · **Winkel:** {s.get('m_angle_avg',0):.0f}°/{s.get('g_angle_avg',0):.0f}° · **Schritte:** {s.get('m_steps',0)}/{s.get('g_steps',0)} · **Touchés:** {s.get('touches',0)} ({s.get('touches_high',0)} high)"""
-        st.markdown(markdown_preview)
+        # Auto-Kommentar
+        auto_comment = f"""
+Michael hielt durchschnittlich {s.get('dist_avg',0):.0f} cm Distanz • {"höhere" if s.get('m_angle_avg',0) > s.get('g_angle_avg',0) else "niedrigere"} Waffenhand als Gegner ({s.get('m_hand_h_avg',0):.0f} vs {s.get('g_hand_h_avg',0):.0f} px) • {"mehr" if s.get('m_steps',0) > s.get('g_steps',0) else "weniger"} Schritte ({s.get('m_steps',0)} vs {s.get('g_steps',0)}) • Korrelation {s.get('correlation',0):.2f} ({'reaktiv' if abs(s.get('lag_frames',0)) < 5 else f'führt an mit {abs(s.get("lag_frames",0))}f Vorsprung'}) • {s.get('touches_high',0)} high-confidence Touché-Kandidaten
+"""
+        st.markdown(f"<div style='color:#8b949e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:6px 10px;'>💬 {auto_comment}</div>", unsafe_allow_html=True)
+    with col_r2:
+        sub_cols = st.columns(2)
+        with sub_cols[0]:
+            if st.button("📄 PDF-Report", type="primary", use_container_width=True):
+                with st.spinner("Generiere PDF..."):
+                    try:
+                        vname = st.session_state.get("vid_name", "Gefecht").replace(".mp4", "")
+                        pdf_path, pdf_preview = generate_report(result, vname)
+                        st.success(f"PDF erstellt: {Path(pdf_path).name}")
+                        with open(pdf_path, "rb") as f:
+                            st.download_button("📥 Download", f.read(), file_name=Path(pdf_path).name, mime="application/pdf", use_container_width=True)
+                    except Exception as e:
+                        st.error(f"PDF-Fehler: {e}")
+        with sub_cols[1]:
+            # Vergleichsmodus: "Zweiten Bereich analysieren"
+            if st.button("➕ Zweiten Bereich analysieren", use_container_width=True):
+                st.session_state["compare_first"] = {
+                    "result": result,
+                    "label": st.session_state.get("vid_name", "Bereich 1").replace(".mp4", ""),
+                }
+                del st.session_state["result"]
+                st.session_state["analyze_second"] = True
+                st.rerun()
+            if st.button("📊 CSV Export", use_container_width=True):
+                csv_lines = ["t,m_dist_cm,m_angle_deg,g_angle_deg,m_lunge_px,g_lunge_px,m_haltung_deg,g_haltung_deg,m_acc_gegner_acc,m_steps,g_steps,m_hand_h_px,g_hand_h_px,m_ext_px,g_ext_px,m_stance_px,g_stance_px,expl_cm_s,m_head_px,g_head_px,m_vel_px_s,g_vel_px_s"]
+                n_frames = len(result["m1_dist"])
+                for i in range(n_frames):
+                    t = result["m1_dist"][i]["t"]
+                    row = [str(t)]
+                    # M1 dist
+                    row.append(str(result["m1_dist"][i].get("cm", 0)))
+                    # M2 angles
+                    row.append(str(result["m2_m_angle"][i].get("deg", 0)) if i < len(result["m2_m_angle"]) else "0")
+                    row.append(str(result["m2_g_angle"][i].get("deg", 0)) if i < len(result["m2_g_angle"]) else "0")
+                    # M3 lunge
+                    row.append(str(result["m3_m_lunge"][i].get("px", 0)) if i < len(result["m3_m_lunge"]) else "0")
+                    row.append(str(result["m3_g_lunge"][i].get("px", 0)) if i < len(result["m3_g_lunge"]) else "0")
+                    # M5 haltung
+                    row.append(str(result["m5_m_tilt"][i].get("deg", 0)) if i < len(result["m5_m_tilt"]) else "0")
+                    row.append(str(result["m5_g_tilt"][i].get("deg", 0)) if i < len(result["m5_g_tilt"]) else "0")
+                    # M6 acc
+                    row.append(str(result["m6_m_acc"][i].get("acc", 0)) if i < len(result["m6_m_acc"]) else "0")
+                    row.append(str(result["m6_g_acc"][i].get("acc", 0)) if i < len(result["m6_g_acc"]) else "0")
+                    # M7 steps
+                    row.append(str(result["m7_m_steps"][i].get("step", 0)) if i < len(result["m7_m_steps"]) else "0")
+                    row.append(str(result["m7_g_steps"][i].get("step", 0)) if i < len(result["m7_g_steps"]) else "0")
+                    # M9 hand height
+                    row.append(str(result["m9_m_hand_h"][i].get("px", 0)) if i < len(result["m9_m_hand_h"]) else "0")
+                    row.append(str(result["m9_g_hand_h"][i].get("px", 0)) if i < len(result["m9_g_hand_h"]) else "0")
+                    # M10 extension
+                    row.append(str(result["m10_m_ext"][i].get("px", 0)) if i < len(result["m10_m_ext"]) else "0")
+                    row.append(str(result["m10_g_ext"][i].get("px", 0)) if i < len(result["m10_g_ext"]) else "0")
+                    # M11 stance
+                    row.append(str(result["m11_m_stance"][i].get("px", 0)) if i < len(result["m11_m_stance"]) else "0")
+                    row.append(str(result["m11_g_stance"][i].get("px", 0)) if i < len(result["m11_g_stance"]) else "0")
+                    # M12 expl (shifted by 1)
+                    row.append(str(result["m12_expl"][i].get("cm_s", 0)) if i < len(result["m12_expl"]) else "0")
+                    # M13 head
+                    row.append(str(result["m13_m_head"][i].get("px", 0)) if i < len(result["m13_m_head"]) else "0")
+                    row.append(str(result["m13_g_head"][i].get("px", 0)) if i < len(result["m13_g_head"]) else "0")
+                    # M8 velocities
+                    row.append(str(result["m8_vel_m"][i]) if i < len(result["m8_vel_m"]) else "0")
+                    row.append(str(result["m8_vel_g"][i]) if i < len(result["m8_vel_g"]) else "0")
+                    csv_lines.append(",".join(row))
+                csv_text = "\n".join(csv_lines)
+                vname = st.session_state.get("vid_name", "Gefecht").replace(".mp4", "")
+                st.download_button("📥 CSV herunterladen", csv_text, file_name=f"Fecht-Daten_{vname}.csv", mime="text/csv", use_container_width=True)
 
     st.markdown(
         f'<a href="{base_url}/player" target="_blank">'
@@ -1261,7 +1365,7 @@ def display_player(result, clip_path):
         high_touches = [t for t in result["m14_touches"] if t["confidence"] == "high"]
         medium_touches = [t for t in result["m14_touches"] if t["confidence"] == "medium"]
 
-        def render_touche_table(touches_list, label):
+        def render_touche_table(touches_list):
             touch_data = []
             for t in touches_list:
                 who_emoji = "🟢" if t["who"] == "Michael" else "🔴" if t["who"] == "Gegner" else "🟡"
@@ -1277,10 +1381,116 @@ def display_player(result, clip_path):
 
         if high_touches:
             st.markdown(f"**{len(high_touches)} high-confidence Treffer**")
-            render_touche_table(high_touches, "high")
+            render_touche_table(high_touches)
         if medium_touches:
             with st.expander(f"⚠️ {len(medium_touches)} medium-confidence Kandidaten (Details)"):
-                render_touche_table(medium_touches, "medium")
+                render_touche_table(medium_touches)
+
+
+def show_comparison():
+    """Zeigt zwei Analysen nebeneinander mit Deltas."""
+    results = st.session_state.get("compare_results", [])
+    labels = st.session_state.get("compare_labels", ["Bereich 1", "Bereich 2"])
+    
+    if len(results) < 2:
+        st.warning("Nicht genug Analysen für Vergleich")
+        st.session_state["compare_mode"] = False
+        st.rerun()
+    
+    r1, r2 = results[0], results[1]
+    s1, s2 = r1["summary"], r2["summary"]
+    lb1, lb2 = labels[0], labels[1]
+    
+    st.markdown("---")
+    st.subheader("📊 Vergleich")
+    st.caption(f"{lb1} vs {lb2}")
+    
+    # Delta Stats in 4 columns
+    def delta_str(v1, v2, unit="", higher_better=""):
+        d = v2 - v1
+        sign = "+" if d > 0 else ""
+        emoji = ""
+        if higher_better == "up" and d > 0: emoji = "🟢"
+        elif higher_better == "down" and d < 0: emoji = "🟢"
+        elif abs(d) > 0: emoji = "🟡"
+        return f"{emoji} {sign}{d:.1f}{unit}" if d != 0 else "—"
+    
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        d1, d2 = s1.get("dist_avg", 0), s2.get("dist_avg", 0)
+        st.metric(f"Distanz ⌀", f"{lb1}: {d1:.0f} cm → {lb2}: {d2:.0f} cm",
+                  delta_str(d1, d2, " cm"))
+    with col_b:
+        m1, m2 = s1.get("m_steps", 0), s2.get("m_steps", 0)
+        st.metric(f"Schritte M", f"{m1} → {m2}",
+                  delta_str(m1, m2, "", "up"))
+    with col_c:
+        c1, c2 = s1.get("correlation", 0), s2.get("correlation", 0)
+        st.metric(f"Korrelation", f"{c1:.2f} → {c2:.2f}",
+                  delta_str(c1, c2, "", "up"))
+    with col_d:
+        t1, t2 = s1.get("touches_high", 0), s2.get("touches_high", 0)
+        st.metric(f"Touchés (high)", f"{t1} → {t2}",
+                  delta_str(t1, t2, "", "up"))
+    
+    # Overlay charts: Distanz side by side
+    st.markdown("---")
+    st.subheader("📈 Distanz-Vergleich")
+    
+    times1 = [d["t"] for d in r1["m1_dist"]]
+    dist1 = [d["cm"] for d in r1["m1_dist"]]
+    times2 = [d["t"] for d in r2["m1_dist"]]
+    dist2 = [d["cm"] for d in r2["m1_dist"]]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=times1, y=dist1, mode="lines", line=dict(color=C_GREEN, width=2), name=lb1, hovertemplate="%{y:.0f} cm"))
+    fig.add_trace(go.Scatter(x=times2, y=dist2, mode="lines", line=dict(color=C_ACCENT, width=2, dash="dash"), name=lb2, hovertemplate="%{y:.0f} cm"))
+    fig.update_layout(
+        title=dict(text="Distanz-Verlauf (überlagert)", font=dict(size=14, color=C_TEXT), x=0.02),
+        paper_bgcolor=C_CARD, plot_bgcolor=C_CARD,
+        font=dict(color=C_MUTED, size=11),
+        xaxis=dict(gridcolor=C_BORDER, title="Zeit (s)", color=C_TEXT),
+        yaxis=dict(gridcolor=C_BORDER, title="cm", color=C_TEXT),
+        margin=dict(l=40, r=16, t=28, b=28),
+        hovermode="x unified",
+        legend=dict(bgcolor="rgba(0,0,0,0.6)", bordercolor=C_BORDER, font=dict(size=10)),
+        height=250,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Step comparison
+    st.markdown("---")
+    st.subheader(f"Details: {lb1} vs {lb2}")
+    
+    # All metrics table
+    comp_data = []
+    metrics_pairs = [
+        ("Distanz ⌀", f"{s1.get('dist_avg',0):.0f} cm", f"{s2.get('dist_avg',0):.0f} cm"),
+        ("Schritte M", str(s1.get('m_steps', 0)), str(s2.get('m_steps', 0))),
+        ("Schritte G", str(s1.get('g_steps', 0)), str(s2.get('g_steps', 0))),
+        ("Winkel M", f"{s1.get('m_angle_avg',0):.0f}°", f"{s2.get('m_angle_avg',0):.0f}°"),
+        ("Winkel G", f"{s1.get('g_angle_avg',0):.0f}°", f"{s2.get('g_angle_avg',0):.0f}°"),
+        ("Beschl M max", f"{s1.get('m_acc_max',0):.0f}", f"{s2.get('m_acc_max',0):.0f}"),
+        ("Beschl G max", f"{s1.get('g_acc_max',0):.0f}", f"{s2.get('g_acc_max',0):.0f}"),
+        ("Handhöhe M", f"{s1.get('m_hand_h_avg',0):.0f} px", f"{s2.get('m_hand_h_avg',0):.0f} px"),
+        ("Arm-Streck M", f"{s1.get('m_ext_avg',0):.0f} px", f"{s2.get('m_ext_avg',0):.0f} px"),
+        ("Standbreite M", f"{s1.get('m_stance_avg',0):.0f} px", f"{s2.get('m_stance_avg',0):.0f} px"),
+        ("Explosivität max", f"{s1.get('expl_max',0):.0f} cm/s", f"{s2.get('expl_max',0):.0f} cm/s"),
+        ("Korrelation", f"{s1.get('correlation',0):.2f}", f"{s2.get('correlation',0):.2f}"),
+        ("Touchés high", str(s1.get('touches_high', 0)), str(s2.get('touches_high', 0))),
+        ("Rhythmus", f"{s1.get('rhythm_dominant',0):.1f} Hz", f"{s2.get('rhythm_dominant',0):.1f} Hz"),
+    ]
+    for label, v1, v2 in metrics_pairs:
+        comp_data.append({"Metrik": label, lb1: v1, lb2: v2})
+    st.dataframe(comp_data, use_container_width=True, hide_index=True)
+    
+    # Clear button
+    if st.button("🔄 Neue Analyse starten", use_container_width=True):
+        st.session_state["compare_mode"] = False
+        st.session_state["analyze_second"] = False
+        for k in ["compare_results", "compare_labels", "compare_first"]:
+            st.session_state.pop(k, None)
+        st.rerun()
 
 
 def display_video_viewer():
@@ -1289,8 +1499,13 @@ def display_video_viewer():
     dur = st.session_state["vid_dur"]
     fps = st.session_state["vid_fps"]
     name = st.session_state["vid_name"]
+    
+    # Check if this is for comparison mode
+    is_compare = st.session_state.get("analyze_second", False)
+    label_prompt = "Zweiten Bereich wählen" if is_compare else name
+    btn_label = "➕ Zweiten Bereich analysieren" if is_compare else "🔍 Bereich analysieren"
 
-    st.subheader(f"\U0001F3AC {name}")
+    st.subheader(f"🎬 {label_prompt}")
 
     # Erstelle komprimierten Preview-Proxy (volle Länge, 480px, ~2-15 MB je nach Dauer)
     preview_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
@@ -1353,8 +1568,9 @@ def display_video_viewer():
 
     # Analysieren-Button
     if clip_dur >= 3:
-        if st.button("\U0001F3AF Bereich analysieren", type="primary", use_container_width=True):
-            run_analysis(st.session_state["video_path"], start_val, clip_dur)
+        if st.button(btn_label, type="primary", use_container_width=True):
+            label = st.session_state.get("analysis_label", "Analyse")
+            run_analysis(st.session_state["video_path"], start_val, clip_dur, label)
     else:
         st.warning("Bereich muss mindestens 3s lang sein")
         st.button("\U0001F3AF Bereich analysieren", disabled=True, use_container_width=True)
