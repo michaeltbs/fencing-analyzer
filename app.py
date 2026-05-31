@@ -8,6 +8,7 @@ Usage:
 import streamlit as st
 st.set_page_config(page_title="Fecht-Analyzer", layout="wide", page_icon="\U0001F93A")
 
+# === IMPORTS ===
 import os, sys, json, math, time, shutil, subprocess, tempfile, struct, base64, socket, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -19,6 +20,9 @@ import cv2
 from PIL import Image
 from ultralytics import YOLO
 from streamlit.components.v1 import html as st_html
+
+# Report-Generator
+from report_generator import generate_report
 
 # --- CONSTS ---
 C_GREEN  = "#00ff88"
@@ -979,7 +983,8 @@ def run_analysis(video_path, start_sec, clip_duration):
     clip_progress.progress(100, text=f"Clip bereit ({clip_size:.1f} MB)")
 
     # Worker im Subprocess starten (complett autark, blockiert UI nicht)
-    subprocess.Popen(
+    start_time = time.time()
+    proc = subprocess.Popen(
         [
             sys.executable,
             WORKER_SCRIPT,
@@ -993,6 +998,7 @@ def run_analysis(video_path, start_sec, clip_duration):
 
     st.session_state["analysis_result_path"] = str(result_path)
     st.session_state["analysis_running"] = True
+    st.session_state["analysis_start_time"] = start_time
     st.rerun()
 
 
@@ -1001,25 +1007,38 @@ def show_analysis_progress():
     """Pollt alle 3s ob der Worker fertig ist. UI bleibt voll responsiv."""
     result_path = Path(st.session_state.get("analysis_result_path", ""))
 
+    # Worker-Timeout check (10 min)
+    start_time = st.session_state.get("analysis_start_time", 0)
+    if start_time and (time.time() - start_time) > 600:
+        st.error("Analyse abgebrochen: Worker hat 10 Minuten überschritten. Kürzeren Bereich wählen oder GPU beschleunigen.")
+        st.session_state["analysis_running"] = False
+        return
+
     st.subheader("Analysiere Video...")
     st.caption("YOLOv8m-Pose verarbeitet Frames im Hintergrund")
 
     done_marker = Path(str(result_path) + ".done")
     if not done_marker.exists() and not result_path.exists():
         # Laeuft noch
+        elapsed = int(time.time() - start_time) if start_time else 0
         st.progress(0.4, text="Frame-Erkennung und Metrik-Berechnung...")
-        st.info("""
-        **Status:** Worker lauft im separaten Prozess
+        st.info(f"""
+        **Status:** Worker läuft im separaten Prozess ({elapsed}s)
         - Keypoint-Extraktion pro Frame
-        - Metrik-Berechnung (9 Metriken)
-        - UI bleibt wahrenddessen voll nutzbar
+        - Metrik-Berechnung (15 Metriken)
+        - UI bleibt währenddessen voll nutzbar
         """)
-        st.markdown("<p style='color:#8b949e; font-size:12px;'>Polling alle 3s - automatische Umschaltung bei Fertigstellung</p>", unsafe_allow_html=True)
+        st.markdown("<p style='color:#8b949e; font-size:12px;'>Polling alle 3s — automatische Umschaltung bei Fertigstellung</p>", unsafe_allow_html=True)
         return
 
     if result_path.exists():
         with open(result_path) as f:
-            data = json.load(f)
+            try:
+                data = json.load(f)
+            except (json.JSONDecodeError, Exception):
+                st.error("Fehler beim Lesen der Analyse-Ergebnisse (korrupte Datei). Bitte erneut versuchen.")
+                st.session_state["analysis_running"] = False
+                return
 
         if "error" in data:
             st.error(f"Analyse fehlgeschlagen: {data['error']}")
@@ -1027,9 +1046,24 @@ def show_analysis_progress():
             st.session_state["analysis_running"] = False
             return
 
+        # No-person check
+        total_keypoints = sum(
+            1 for f in data.get("frame_data", [])
+            if f.get("m") is not None and any(f["m"][i] > 0 for i in range(0, 34, 2))
+        )
+        if total_keypoints < 5:
+            st.warning("""
+            **Keine Fechter erkannt.** Mögliche Ursachen:
+            - Andere Kamera-Perspektive (seitlich statt frontal?)
+            - Zu weit weg (Fechter zu klein im Bild)
+            - Video enthält keinen Fechtkampf
+            """)
+            st.session_state["analysis_running"] = False
+            return
+
         st.success("Analyse abgeschlossen! Lade Live-Player...")
         st.session_state["result"] = data
-        st.session_state["clip_path"] = result_path.parent / f"fencing_clip_{Path(str(result_path)).stem.split('_')[-1]}.mp4"
+        st.session_state["clip_path"] = Path(str(result_path).replace("fencing_result_", "fencing_clip_").replace(".json", ".mp4"))
         st.session_state["analysis_running"] = False
         st.rerun()
 
@@ -1086,6 +1120,23 @@ def display_player(result, clip_path):
     col7.metric("Standbreite M/G", f'{s.get("m_stance_avg", 0):.0f} / {s.get("g_stance_avg", 0):.0f} px')
     col8.metric("Touchés", f'{s.get("touches", 0)} ({s.get("touches_high", 0)} high)')
 
+    # Report Button
+    col_r1, col_r2 = st.columns([3, 1])
+    with col_r2:
+        if st.button("📄 Bundestrainer-Report (PDF)", type="primary", use_container_width=True):
+            with st.spinner("Generiere PDF..."):
+                try:
+                    vname = st.session_state.get("vid_name", "Gefecht").replace(".mp4", "")
+                    pdf_path, pdf_preview = generate_report(result, vname)
+                    st.success(f"PDF erstellt: {Path(pdf_path).name}")
+                    with open(pdf_path, "rb") as f:
+                        st.download_button("📥 PDF herunterladen", f.read(), file_name=Path(pdf_path).name, mime="application/pdf", use_container_width=True)
+                except Exception as e:
+                    st.error(f"PDF-Fehler: {e}")
+    with col_r1:
+        markdown_preview = f"""**⌀ Distanz:** {s.get('dist_avg',0):.0f} cm · **Winkel:** {s.get('m_angle_avg',0):.0f}°/{s.get('g_angle_avg',0):.0f}° · **Schritte:** {s.get('m_steps',0)}/{s.get('g_steps',0)} · **Touchés:** {s.get('touches',0)} ({s.get('touches_high',0)} high)"""
+        st.markdown(markdown_preview)
+
     st.markdown(
         f'<a href="{base_url}/player" target="_blank">'
         f'<button style="width:100%;padding:14px;background:#238636;border:1px solid #2ea043;'
@@ -1124,7 +1175,14 @@ def display_player(result, clip_path):
     c1, c2, c3 = st.columns(3)
     dist_data = [d["cm"] for d in result["m1_dist"]]
     with c1:
-        st.plotly_chart(make_plotly("Distanz", dist_data, C_BLUE, "cm", [0, max(dist_data)*1.15 or 200]), use_container_width=True)
+        fig = make_plotly("Distanz", dist_data, C_BLUE, "cm", [0, max(dist_data)*1.15 or 200])
+        # Add vertical touché lines
+        for t in result.get("m14_touches", []):
+            color = C_GREEN if t["who"] == "Michael" else C_RED if t["who"] == "Gegner" else "#ffaa00"
+            fig.add_vline(x=t["t"], line=dict(color=color, width=1, dash="dot"),
+                          annotation_text="🎯" if t["confidence"] == "high" else "",
+                          annotation_position="top")
+        st.plotly_chart(fig, use_container_width=True)
     with c2:
         m_ang = [d["deg"] for d in result["m2_m_angle"]]
         st.plotly_chart(make_plotly("Winkel M", m_ang, C_GREEN, "°", [0, 180]), use_container_width=True)
@@ -1200,20 +1258,29 @@ def display_player(result, clip_path):
     if result["m14_touches"]:
         st.markdown("---")
         st.subheader("🎯 Touché-Kandidaten")
-        touch_data = []
-        for t in result["m14_touches"]:
-            who_emoji = "🟢" if t["who"] == "Michael" else "🔴" if t["who"] == "Gegner" else "🟡"
-            conf_badge = "✅" if t["confidence"] == "high" else "⚠️"
-            touch_data.append({
-                "Zeit": f'{t["t"]:.1f}s',
-                "Wer": f'{who_emoji} {t["who"]}',
-                "Conf": conf_badge,
-                "Distanz": f'{t["dist_cm"]:.0f} cm',
-                "Ext M": f'{t["ext_m"]:.0f} px',
-                "Ext G": f'{t["ext_g"]:.0f} px',
-                "Löst sich": "✓" if t["resolves"] else "✗",
-            })
-        st.dataframe(touch_data, use_container_width=True, hide_index=True)
+        high_touches = [t for t in result["m14_touches"] if t["confidence"] == "high"]
+        medium_touches = [t for t in result["m14_touches"] if t["confidence"] == "medium"]
+
+        def render_touche_table(touches_list, label):
+            touch_data = []
+            for t in touches_list:
+                who_emoji = "🟢" if t["who"] == "Michael" else "🔴" if t["who"] == "Gegner" else "🟡"
+                touch_data.append({
+                    "Zeit": f'{t["t"]:.1f}s',
+                    "Wer": f'{who_emoji} {t["who"]}',
+                    "Distanz": f'{t["dist_cm"]:.0f} cm',
+                    "Ext M": f'{t["ext_m"]:.0f} px',
+                    "Ext G": f'{t["ext_g"]:.0f} px',
+                    "Löst sich": "✓" if t["resolves"] else "✗",
+                })
+            st.dataframe(touch_data, use_container_width=True, hide_index=True)
+
+        if high_touches:
+            st.markdown(f"**{len(high_touches)} high-confidence Treffer**")
+            render_touche_table(high_touches, "high")
+        if medium_touches:
+            with st.expander(f"⚠️ {len(medium_touches)} medium-confidence Kandidaten (Details)"):
+                render_touche_table(medium_touches, "medium")
 
 
 def display_video_viewer():

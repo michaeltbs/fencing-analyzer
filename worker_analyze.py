@@ -110,14 +110,40 @@ try:
 
     # Kalibrierung
     all_hip_x = []
+    all_hip_y = []
     for f in frame_data:
         for label in ("m", "g"):
             k = f[label]
             if k:
-                hip_x = k[22]
-                if hip_x > 0:
-                    all_hip_x.append(hip_x)
-    piste_px = (max(all_hip_x) - min(all_hip_x)) if all_hip_x else PISTE_WIDTH_PX_FALLBACK
+                hip_lx = k[22]
+                hip_ly = k[23]
+                hip_rx = k[24]
+                hip_ry = k[25]
+                if hip_lx > 0: all_hip_x.append(hip_lx)
+                if hip_rx > 0: all_hip_x.append(hip_rx)
+                if hip_ly > 0: all_hip_y.append(hip_ly)
+                if hip_ry > 0: all_hip_y.append(hip_ry)
+    
+    # Determine orientation: if hip x-range > y-range → horizontal (side view), else → vertical (front/back)
+    x_range = max(all_hip_x) - min(all_hip_x) if all_hip_x else 0
+    y_range = max(all_hip_y) - min(all_hip_y) if all_hip_y else 0
+    
+    if x_range > y_range * 1.5:
+        orientation = "seitlich"
+        piste_px = x_range if x_range > 0 else PISTE_WIDTH_PX_FALLBACK
+    else:
+        orientation = "frontal"
+        # For frontal view: estimate from shoulder width (typically ~40cm real)
+        all_shoulder_dists = []
+        for f in frame_data:
+            for label in ("m", "g"):
+                k = f[label]
+                if k:
+                    ls = get_kp(k, 5); rs = get_kp(k, 6)
+                    if ls and rs:
+                        all_shoulder_dists.append(math.hypot(ls[0]-rs[0], ls[1]-rs[1]))
+        shoulder_px = np.median(all_shoulder_dists) if all_shoulder_dists else 40
+        piste_px = shoulder_px * (PISTE_WIDTH_CM / 40)  # ~200/40 = 5x shoulder width
     px_per_cm = piste_px / PISTE_WIDTH_CM
 
     def get_kp(flat, idx):
@@ -372,36 +398,62 @@ try:
         else:
             m12_expl.append({"t": m1_dist[i]["t"], "cm_s": 0})
 
-    # === M14: Treffer-Kandidaten (Arm-Streckung >80% max AND Distanz <30%-Perzentil) ===
+    # === M14: Treffer-Kandidaten (Arm-Streckung >90% max AND Distanz <15%-Perzentil, min 3 Frames) ===
     dist_cm = [d["cm"] for d in m1_dist if d["cm"] > 0]
-    dist_p30 = float(np.percentile(dist_cm, 30)) if dist_cm else 0
+    dist_p15 = float(np.percentile(dist_cm, 15)) if dist_cm else 0
     m14_touches = []
+
+    # Pre-compute candidate frames: (frame_idx, reason)
+    candidate_flags = []
     for i in range(1, len(m1_dist)):
         ext_m = m10_m_ext[i]["px"] if i < len(m10_m_ext) else 0
         ext_g = m10_g_ext[i]["px"] if i < len(m10_g_ext) else 0
         d_val = m1_dist[i]["cm"]
-        t_val = m1_dist[i]["t"]
 
-        # Kriterium: Arm fast voll gestreckt AND beide nah beieinander
-        m_candidate = ext_m > 0.8 * m_ext_max and m_ext_max > 10 and d_val < dist_p30
-        g_candidate = ext_g > 0.8 * g_ext_max and g_ext_max > 10 and d_val < dist_p30
+        m_stretched = ext_m > 0.9 * m_ext_max and m_ext_max > 10
+        g_stretched = ext_g > 0.9 * g_ext_max and g_ext_max > 10
+        close_enough = d_val < dist_p15 and dist_p15 > 0
 
-        if m_candidate or g_candidate:
-            who = "Michael" if m_candidate else "Gegner"
-            if g_candidate and m_candidate:
-                who = "beide"
-            # Prüfe: löst sich danach auf (Distanz steigt)?
-            future_dist = [m1_dist[j]["cm"] for j in range(i, min(i+5, len(m1_dist))) if m1_dist[j]["cm"] > 0]
-            resolves = any(fd > d_val * 1.15 for fd in future_dist) if future_dist else False
-            m14_touches.append({
-                "t": t_val,
-                "who": who,
-                "ext_m": ext_m,
-                "ext_g": ext_g,
-                "dist_cm": d_val,
-                "resolves": resolves,
-                "confidence": "high" if resolves else "medium",
-            })
+        if (m_stretched or g_stretched) and close_enough:
+            who = []
+            if m_stretched: who.append("Michael")
+            if g_stretched: who.append("Gegner")
+            t_val = m1_dist[i]["t"]
+            candidate_flags.append({"i": i, "t": t_val, "who": " + ".join(who), "ext_m": ext_m, "ext_g": ext_g, "dist": d_val})
+        else:
+            candidate_flags.append(None)
+
+    # Merge consecutive candidate frames into episodes (min 3 frames = ~100ms)
+    episodes = []
+    current = []
+    for idx, cf in enumerate(candidate_flags):
+        if cf is not None:
+            current.append(cf)
+        else:
+            if len(current) >= 3:
+                episodes.append(current)
+            current = []
+    if len(current) >= 3:
+        episodes.append(current)
+
+    for ep in episodes:
+        mid = ep[len(ep)//2]
+        i = mid["i"]
+        d_val = mid["dist"]
+        # Check resolve: distance rises >15% within next 10 frames
+        future_dist = [m1_dist[j]["cm"] for j in range(i, min(i+10, len(m1_dist))) if m1_dist[j]["cm"] > 0]
+        resolves = any(fd > d_val * 1.15 for fd in future_dist) if future_dist else False
+        t_val = mid["t"]
+        who = mid["who"]
+        m14_touches.append({
+            "t": t_val,
+            "who": who,
+            "ext_m": mid["ext_m"],
+            "ext_g": mid["ext_g"],
+            "dist_cm": d_val,
+            "resolves": resolves,
+            "confidence": "high" if resolves else "medium",
+        })
 
     # === M15: Rhythmus-Pattern (FFT über Distanz, 5s-Fenster) ===
     m15_rhythm = []
@@ -469,6 +521,10 @@ try:
         "touches": len(m14_touches),
         "touches_high": len([t for t in m14_touches if t["confidence"] == "high"]),
         "rhythm_dominant": round(max(r["freq_hz"] for r in m15_rhythm), 2) if m15_rhythm else 0,
+        # Kalibrierung
+        "orientation": orientation,
+        "piste_px": round(piste_px, 0),
+        "px_per_cm": round(px_per_cm, 2),
     }
 
     result = {
