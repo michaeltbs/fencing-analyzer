@@ -1,0 +1,14 @@
+__pycache__
+.git
+.gitignore
+*.pyc
+*.pyo
+.env
+*.md
+test_*.py
+model_eval_prompts.py
+reports/*.pdf
+reports/*.png
+.hermes
+venv
+.DS_Store

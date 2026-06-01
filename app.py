@@ -203,9 +203,17 @@ def angle_at(p1, p2, p3):
 def load_model():
     return YOLO("yolov8m-pose.pt")
 
+def _ffmpeg():
+    """Return ffmpeg path. Works on Windows dev and Linux Docker."""
+    if sys.platform == "win32":
+        p = Path.home() / "AppData/Local/hermes/hermes-agent/venv/Scripts/ffmpeg.exe"
+        if p.exists():
+            return str(p)
+    return "ffmpeg"
+
 def extract_clip(video_path, output_path, start_sec=0, duration_sec=15, target_width=640):
     cmd = [
-        str(Path.home() / "AppData/Local/hermes/hermes-agent/venv/Scripts/ffmpeg.exe"),
+        _ffmpeg(),
         "-ss", str(start_sec), "-t", str(duration_sec),
         "-i", str(video_path),
         "-vf", f"scale={target_width}:-2",
@@ -1512,7 +1520,7 @@ def display_video_viewer():
     preview_path = preview_tmp.name
     preview_tmp.close()
     subprocess.run([
-        str(Path.home() / "AppData/Local/hermes/hermes-agent/venv/Scripts/ffmpeg.exe"),
+        _ffmpeg(),
         "-i", str(vp),
         "-vf", "scale=480:-2",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-an",
