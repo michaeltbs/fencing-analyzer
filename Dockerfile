@@ -1,15 +1,20 @@
-# Fencing Analyzer — Docker Image
-# YOLOv8m Pose-Estimation + Streamlit UI + Media Server
-#
-# Build:   docker build -t fencing-analyzer .
-# Run:     docker run -p 8501:8501 -v /path/to/videos:/videos fencing-analyzer
-#          -> open http://localhost:8501
+# Fencing Analyzer — Multi-Arch Docker Image
+# CPU:   docker build -t fencing-analyzer .
+# GPU:   docker build --build-arg BASE_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu22.04 \
+#                     --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu121 \
+#                     -t fencing-analyzer:gpu .
+# Run:   docker run --gpus all -p 8501:8501 -v /videos:/videos fencing-analyzer:gpu
+#        -> open http://localhost:8501
 
-FROM python:3.11-slim
+# === BUILD ARGS ===
+ARG BASE_IMAGE=python:3.11-slim
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+
+FROM ${BASE_IMAGE} AS base
 
 WORKDIR /app
 
-# Install system deps: OpenCV, ffmpeg, numpy build deps
+# Install system deps: ffmpeg + OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1-mesa-glx \
@@ -24,19 +29,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install PyTorch with correct backend (CPU or CUDA via build arg)
+ARG TORCH_INDEX
+RUN pip install --no-cache-dir torch --index-url ${TORCH_INDEX}
+
 # Copy app code
 COPY app.py worker_analyze.py report_generator.py ./
 COPY reports ./reports
-
-# Create reports directory (writable)
 RUN mkdir -p /app/reports
 
-# Expose Streamlit + media server ports
+# Verify GPU availability at build time
+RUN python -c "
+import torch, sys
+cuda = torch.cuda.is_available()
+gpu_count = torch.cuda.device_count() if cuda else 0
+print(f'PyTorch {torch.__version__} — CUDA: {cuda} ({gpu_count} GPU(s))')
+if cuda:
+    for i in range(gpu_count):
+        print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
+    sys.exit(0)
+else:
+    print('  Running on CPU')
+    sys.exit(0)
+"
+
 EXPOSE 8501
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501').read()" || exit 1
 
-# Run
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
