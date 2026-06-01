@@ -173,11 +173,16 @@ try:
     m7_m_steps, m7_g_steps = [], []
     m8_vel_m, m8_vel_g = [], []
 
-    # Neue Metriken 9-13 (in-loop), 12+14+15 (post-loop)
+    # Neue Metriken 9-15
     m9_m_hand_h, m9_g_hand_h = [], []
     m10_m_ext, m10_g_ext = [], []
     m11_m_stance, m11_g_stance = [], []
     m13_m_head, m13_g_head = [], []
+
+    # M16: Pressure Index — kumulativer Vorteil im Vor-Rückzug
+    m16_pressure = []
+    m16_m_advance = 0  # positive cumulative advance (Michael)
+    m16_g_advance = 0  # negative cumulative advance (Gegner)
 
     prev_m_hip, prev_g_hip = None, None
     m_step_active, g_step_active = False, False
@@ -374,6 +379,33 @@ try:
         prev_m_hip = m_hip
         prev_g_hip = g_hip
 
+        # --- M16: Pressure Index (wer treibt das Gefecht?) ---
+        # Bei Seitenansicht: x-Achse = Pisten-Richtung. Michael auf linker Seite → x steigt = Vorwärts
+        # Pressure = kumulativer Vorteil: Michael vor + Gegner zurück
+        if m_hip and g_hip and prev_m_hip and prev_g_hip:
+            # Orientierung: wer ist rechts von wem?
+            m_adv_dir = 1 if g_hip[0] > m_hip[0] else -1  # 1: Gegner ist rechts → Michael vor = x+
+            g_adv_dir = -m_adv_dir  # Gegner-Vorwärts ist entgegengesetzt
+            
+            # Michael: positive Bewegung in Richtung Gegner
+            m_move = (m_hip[0] - prev_m_hip[0]) * m_adv_dir
+            m16_m_advance += max(0, m_move)
+            m16_g_advance += max(0, -m_move)  # Michael-Rückzug = Gegner gewinnt Raum
+            
+            # Gegner: seine Vorwärts-Bewegung in seine Richtung
+            g_move = (g_hip[0] - prev_g_hip[0]) * g_adv_dir
+            m16_g_advance += max(0, g_move)
+            m16_m_advance += max(0, -g_move)  # Gegner-Rückzug = Michael gewinnt Raum
+            
+            # Netto-Druck: positiv = Michael dominiert
+            net = m16_m_advance - m16_g_advance
+            m16_pressure.append({"t": t, "net_px": round(net, 1)})
+        else:
+            if m16_pressure:
+                m16_pressure.append({"t": t, "net_px": m16_pressure[-1]["net_px"]})
+            else:
+                m16_pressure.append({"t": t, "net_px": 0})
+
     # === M8 Synchronisierung (Post-Loop) ===
     vel_m_arr = [v for v in m8_vel_m] if m8_vel_m else [0]
     vel_g_arr = [v for v in m8_vel_g] if m8_vel_g else [0]
@@ -525,6 +557,9 @@ try:
         "orientation": orientation,
         "piste_px": round(piste_px, 0),
         "px_per_cm": round(px_per_cm, 2),
+        "m16_pressure_net": round(m16_pressure[-1]["net_px"] if m16_pressure else 0, 1),
+        "m16_pressure_max": round(max(abs(d["net_px"]) for d in m16_pressure), 1) if m16_pressure else 0,
+        "m16_pressure_leader": "Michael" if (m16_pressure and m16_pressure[-1]["net_px"] > 0) else ("Gegner" if (m16_pressure and m16_pressure[-1]["net_px"] < 0) else "neutral"),
     }
 
     result = {
@@ -556,6 +591,7 @@ try:
         "m13_g_head": m13_g_head,
         "m14_touches": m14_touches,
         "m15_rhythm": m15_rhythm,
+        "m16_pressure": m16_pressure,
     }
 
     with open(result_path, "w") as f:

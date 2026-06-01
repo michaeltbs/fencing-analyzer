@@ -212,7 +212,7 @@ def extract_clip(video_path, output_path, start_sec=0, duration_sec=15, target_w
         "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an",
         "-y", str(output_path)
     ]
-    subprocess.run(cmd, capture_output=True, timeout=600)
+    subprocess.run(cmd, capture_output=True, timeout=1800)
     return output_path.exists()
 
 def analyze_video(video_path, progress_callback=None, model=None):
@@ -1517,7 +1517,7 @@ def display_video_viewer():
         "-vf", "scale=480:-2",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-an",
         "-y", preview_path
-    ], capture_output=True, timeout=300)
+    ], capture_output=True, timeout=900)
     try:
         with open(preview_path, "rb") as f:
             vid_data = f.read()
@@ -1544,7 +1544,7 @@ def display_video_viewer():
             "Ende (Sekunden)",
             min_value=0.0,
             max_value=dur,
-            value=min(30.0, dur),
+            value=dur,
             step=0.5,
             key="vid_end_inp",
             format="%.1f"
