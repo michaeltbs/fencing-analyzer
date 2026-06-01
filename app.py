@@ -951,8 +951,10 @@ def main():
                             timestamp = int(time.time())
                             out_path = Path(tempfile.gettempdir()) / f"fencing_yt_{timestamp}.mp4"
                             cmd = [sys.executable, "-m", "yt_dlp",
-                                   "-f", "best[height<=720]",
-                                   "-o", str(out_path), "--no-playlist", "--quiet", yt_url]
+                            "-f", "best[height<=720]",
+                            "--js-runtimes", "deno",
+                            "-o", str(out_path), "--no-playlist", "--quiet",
+                            yt_url]
                             dl_progress.progress(50, text="YouTube-Download läuft...")
                             result = sp.run(cmd, capture_output=True, text=True, timeout=600)
                             dl_progress.progress(90, text="Verarbeite...")
@@ -961,8 +963,13 @@ def main():
                                 st.success(f"YouTube-Video geladen: {out_path.stat().st_size/1e6:.0f} MB")
                                 dl_progress.progress(100, text="Bereit!")
                             else:
-                                st.error(f"Download fehlgeschlagen. {result.stderr[:200]}")
+                                err = result.stderr.lower()
+                                if "sign in" in err:
+                                    st.error("🔒 YouTube fordert Login für dieses Video (privat/altersbeschränkt). Nutze Upload oder lokalen Pfad.")
+                                else:
+                                    st.error(f"Download fehlgeschlagen. {result.stderr[:200]}")
                                 dl_progress.empty()
+
                         except Exception as e:
                             st.error(f"Fehler beim Download: {str(e)[:200]}")
                             dl_progress.empty()
