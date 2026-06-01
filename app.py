@@ -9,7 +9,7 @@ import streamlit as st
 st.set_page_config(page_title="Fecht-Analyzer", layout="wide", page_icon="\U0001F93A")
 
 # === IMPORTS ===
-import os, sys, json, math, time, shutil, subprocess, tempfile, struct, base64, socket, threading
+import os, sys, json, math, time, shutil, subprocess, tempfile, struct, base64, socket, threading, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
@@ -931,48 +931,79 @@ def main():
     st.caption(f"YOLOv8m-Pose | 15 Metriken | Live-Video-Player | {gpu_label}")
 
     with st.sidebar:
-        st.header("Video-Quelle")
-        input_mode = st.radio("Quelle", ["Datei-Upload", "Lokaler Pfad"], horizontal=True)
-        video_path = None
+            st.header("Video-Quelle")
+            input_mode = st.radio("Quelle", ["Datei-Upload", "Lokaler Pfad", "YouTube-Link"], horizontal=True)
+            video_path = None
 
-        if input_mode == "Datei-Upload":
-            uploaded = st.file_uploader("Video hochladen", type=["mp4", "mov", "avi", "mkv"])
-            if uploaded:
-                tmp = Path(tempfile.gettempdir()) / "fencing_upload.mp4"
-                with open(tmp, "wb") as f:
-                    f.write(uploaded.getbuffer())
-                video_path = tmp
-        else:
-            path_str = st.text_input("Pfad zum Video",
-                value="C:\\Users\\micha\\Desktop\\Doha 2026\\Veneis-SUI.mp4")
-            if path_str:
-                p = Path(path_str.strip('"').strip("'"))
-                if p.exists():
-                    video_path = p
-                    st.success(f"Gefunden: {p.name} ({p.stat().st_size / 1e6:.0f} MB)")
-                else:
-                    st.error("Datei nicht gefunden")
+            if input_mode == "YouTube-Link":
+                yt_url = st.text_input("YouTube/Streamable-Link", placeholder="https://www.youtube.com/watch?v=...")
+                if yt_url and yt_url.strip():
+                    yt_url = yt_url.strip()
+                    if not any(x in yt_url.lower() for x in ['youtube.com', 'youtu.be', 'streamable.com', 'vimeo.com']):
+                        st.error("Bitte einen gültigen YouTube-, Streamable- oder Vimeo-Link eingeben")
+                    else:
+                        dl_progress = st.progress(0, text="Lade Video herunter...")
+                        try:
+                            import subprocess as sp
+                            sp.run([sys.executable, "-m", "pip", "install", "yt-dlp", "-q"],
+                                   capture_output=True, timeout=60)
+                            dl_progress.progress(25, text="yt-dlp bereit...")
+                            timestamp = int(time.time())
+                            out_path = Path(tempfile.gettempdir()) / f"fencing_yt_{timestamp}.mp4"
+                            cmd = [sys.executable, "-m", "yt_dlp",
+                                   "-f", "best[height<=720]",
+                                   "-o", str(out_path), "--no-playlist", "--quiet", yt_url]
+                            dl_progress.progress(50, text="YouTube-Download läuft...")
+                            result = sp.run(cmd, capture_output=True, text=True, timeout=600)
+                            dl_progress.progress(90, text="Verarbeite...")
+                            if out_path.exists() and out_path.stat().st_size > 100000:
+                                video_path = out_path
+                                st.success(f"YouTube-Video geladen: {out_path.stat().st_size/1e6:.0f} MB")
+                                dl_progress.progress(100, text="Bereit!")
+                            else:
+                                st.error(f"Download fehlgeschlagen. {result.stderr[:200]}")
+                                dl_progress.empty()
+                        except Exception as e:
+                            st.error(f"Fehler beim Download: {str(e)[:200]}")
+                            dl_progress.empty()
 
-        if video_path:
-            # Nur setzen wenn noch nicht in session_state
-            vp_key = str(video_path.resolve())
-            if st.session_state.get("video_path_key") != vp_key:
-                cap = cv2.VideoCapture(str(video_path))
-                total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-                cap.release()
-                vid_dur = total_f / vid_fps if vid_fps > 0 else 0
-                vid_name = Path(video_path).name
-                st.caption(f"\U0001F4F9 {vid_name} — {vid_dur:.0f}s @ {vid_fps:.0f}fps")
-
-                st.session_state["video_path"] = video_path
-                st.session_state["video_path_key"] = vp_key
-                st.session_state["vid_dur"] = vid_dur
-                st.session_state["vid_fps"] = vid_fps
-                st.session_state["vid_name"] = vid_name
-                st.rerun()
+            elif input_mode == "Datei-Upload":
+                uploaded = st.file_uploader("Video hochladen", type=["mp4", "mov", "avi", "mkv"])
+                if uploaded:
+                    tmp = Path(tempfile.gettempdir()) / "fencing_upload.mp4"
+                    with open(tmp, "wb") as f:
+                        f.write(uploaded.getbuffer())
+                    video_path = tmp
             else:
-                st.caption(f"\U0001F4F9 {st.session_state['vid_name']} — {st.session_state['vid_dur']:.0f}s @ {st.session_state['vid_fps']:.0f}fps")
+                path_str = st.text_input("Pfad zum Video",
+                    value="C:\\Users\\micha\\Desktop\\Doha 2026\\Veneis-SUI.mp4")
+                if path_str:
+                    p = Path(path_str.strip('"').strip("'"))
+                    if p.exists():
+                        video_path = p
+                        st.success(f"Gefunden: {p.name} ({p.stat().st_size / 1e6:.0f} MB)")
+                    else:
+                        st.error("Datei nicht gefunden")
+
+            if video_path:
+                        vp_key = str(video_path.resolve())
+                        if st.session_state.get("video_path_key") != vp_key:
+                            cap = cv2.VideoCapture(str(video_path))
+                            total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                            cap.release()
+                            vid_dur = total_f / vid_fps if vid_fps > 0 else 0
+                            vid_name = Path(video_path).name
+                            st.caption(f"\U0001F4F9 {vid_name} — {vid_dur:.0f}s @ {vid_fps:.0f}fps")
+
+                            st.session_state["video_path"] = video_path
+                            st.session_state["video_path_key"] = vp_key
+                            st.session_state["vid_dur"] = vid_dur
+                            st.session_state["vid_fps"] = vid_fps
+                            st.session_state["vid_name"] = vid_name
+                            st.rerun()
+                        else:
+                            st.caption(f"\U0001F4F9 {st.session_state['vid_name']} — {st.session_state['vid_dur']:.0f}s @ {st.session_state['vid_fps']:.0f}fps")
 
     if st.session_state.get("analysis_running"):
         show_analysis_progress()
