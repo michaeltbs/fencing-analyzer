@@ -39,19 +39,7 @@ COPY reports ./reports
 RUN mkdir -p /app/reports
 
 # Verify GPU availability at build time
-RUN python -c "
-import torch, sys
-cuda = torch.cuda.is_available()
-gpu_count = torch.cuda.device_count() if cuda else 0
-print(f'PyTorch {torch.__version__} — CUDA: {cuda} ({gpu_count} GPU(s))')
-if cuda:
-    for i in range(gpu_count):
-        print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
-    sys.exit(0)
-else:
-    print('  Running on CPU')
-    sys.exit(0)
-"
+RUN python -c "import torch,sys;c=torch.cuda.is_available();n=torch.cuda.device_count() if c else 0;print(f'PyTorch {torch.__version__} - CUDA: {c} ({n} GPU(s))');[print(f'  GPU {i}: {torch.cuda.get_device_name(i)}') for i in range(n)];sys.exit(0)"
 
 EXPOSE 8501
 
