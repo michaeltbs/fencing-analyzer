@@ -928,7 +928,7 @@ def main():
         gpu_available = False
         gpu_name = ""
     gpu_label = f"GPU: {gpu_name}" if gpu_available else "CPU (PyTorch)"
-    st.caption(f"YOLOv8m-Pose | 15 Metriken | Live-Video-Player | {gpu_label}")
+    st.caption(f"YOLOv8m-Pose | 15 Metriken | Live-Video-Player | Tracking v2 | {gpu_label}")
 
     with st.sidebar:
             st.header("Video-Quelle")
@@ -1091,20 +1091,19 @@ def show_analysis_progress():
         return
 
     st.subheader("Analysiere Video...")
-    st.caption("YOLOv8m-Pose verarbeitet Frames im Hintergrund")
+    st.caption("YOLOv8m-Pose | optimiertes Tracking v2 (Side-Constraint + Velocity-Interpolation + Smoothing)")
 
     done_marker = Path(str(result_path) + ".done")
     if not done_marker.exists() and not result_path.exists():
-        # Laeuft noch
         elapsed = int(time.time() - start_time) if start_time else 0
-        st.progress(0.4, text="Frame-Erkennung und Metrik-Berechnung...")
-        st.info(f"""
-        **Status:** Worker läuft im separaten Prozess ({elapsed}s)
-        - Keypoint-Extraktion pro Frame
-        - Metrik-Berechnung (15 Metriken)
-        - UI bleibt währenddessen voll nutzbar
-        """)
-        st.markdown("<p style='color:#8b949e; font-size:12px;'>Polling alle 3s — automatische Umschaltung bei Fertigstellung</p>", unsafe_allow_html=True)
+        progress_val = min(0.95, elapsed / 120)
+        st.progress(progress_val, text=f"Frame-Erkennung und Metrik-Berechnung... ({elapsed}s)")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"**Worker läuft** — {elapsed}s")
+        with col2:
+            est_remaining = max(1, 120 - elapsed)
+            st.markdown(f"<p style='color:#8b949e; font-size:13px;'>Geschätzt: ~{est_remaining}s verbleibend</p>", unsafe_allow_html=True)
         return
 
     if result_path.exists():
@@ -1553,52 +1552,18 @@ def display_video_viewer():
 
     st.subheader(f"🎬 {label_prompt}")
 
-    # Erstelle komprimierten Preview-Proxy (volle Länge, 480px, ~2-15 MB je nach Dauer)
-    preview_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    preview_path = preview_tmp.name
-    preview_tmp.close()
-    subprocess.run([
-        _ffmpeg(),
-        "-i", str(vp),
-        "-vf", "scale=480:-2",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-an",
-        "-y", preview_path
-    ], capture_output=True, timeout=900)
-    try:
-        with open(preview_path, "rb") as f:
-            vid_data = f.read()
-        st.video(vid_data, start_time=0)
-    finally:
-        Path(preview_path).unlink(missing_ok=True)
-
-    # Timeline-Bereichsauswahl als native Streamlit-UI
+    # Timeline-Bereichsauswahl als Dual-Slider
     st.markdown("<hr style='border-color:#30363d; margin:6px 0;'>", unsafe_allow_html=True)
 
-    col_s, col_e = st.columns([1, 1])
-    with col_s:
-        start_val = st.number_input(
-            "Start (Sekunden)",
-            min_value=0.0,
-            max_value=dur,
-            value=0.0,
-            step=0.5,
-            key="vid_start_inp",
-            format="%.1f"
-        )
-    with col_e:
-        end_val = st.number_input(
-            "Ende (Sekunden)",
-            min_value=0.0,
-            max_value=dur,
-            value=dur,
-            step=0.5,
-            key="vid_end_inp",
-            format="%.1f"
-        )
-
-    # Korrektur falls Start > Ende
-    if start_val > end_val:
-        start_val, end_val = end_val, start_val
+    start_val, end_val = st.slider(
+        "Bereich auswählen (Sekunden)",
+        min_value=0.0,
+        max_value=dur,
+        value=(0.0, min(dur, 60.0)),
+        step=0.5,
+        format="%.1fs",
+        key="vid_range_slider"
+    )
 
     clip_dur = end_val - start_val
     clip_frames = int(clip_dur * fps)

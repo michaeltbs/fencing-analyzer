@@ -13,6 +13,9 @@ Interaktives Dashboard mit 15 Metriken, PDF-Report und Live-Video-Player.
 - **15 Metriken:** Distanz, Waffenarm-Winkel, Lunge-Tiefe, Bewegungs-Pfad, Körperhaltung, Beschleunigung, Schritt-Rhythmus, Reaktions-Synchronisierung, Heatmap, Touche-Detektion, Druck-Index uvm.
 - **2-Personen-Tracking** — automatisch, Frame für Frame
 - **Pisten-Kalibrierung** — automatische cm-Umrechnung
+- **Tracking v2:** Side-Constraint + Velocity-Interpolation + Keypoint-Smoothing
+- **Dual-Range-Slider** für präzise Bereichsauswahl
+- **Dynamische Progress-Bar** mit Zeit-Schätzung
 - **PDF-Report** — 1 Seite, mit Diagrammen und Statistik
 - **Vergleichsmodus** — zwei Analysen überlagern
 - **Export:** JSON, CSV
@@ -223,9 +226,14 @@ docker run --gpus all -p 8501:8501 fencing-analyzer:gpu
 | 6 | Beschleunigung | 2. Ableitung Waffenhand | px/s² |
 | 7 | Schritt-Rhythmus | Einzelfuss-Tracking (halb/ganz) | Schritte/s |
 | 8 | Synchronisierung | Cross-Correlation Hüft-Geschw. | r, Lag |
-| 9 | Heatmap | 2D-Histogramm Pisten-Position | Dichte |
-| 10 | Druck-Index | Wer treibt das Gefecht? | ± Wert |
-| 11-15 | Weitere Metriken | Touche, Tempo, etc. | siehe UI |
+| 9 | Handhöhe | Schulter-Handgelenk Höhen-Differenz | px |
+| 10 | Arm-Streckung | Schulter-Handgelenk Distanz | px |
+| 11 | Standbreite | Fuss-zu-Fuss Abstand | px |
+| 12 | Explosivität | Distanz-Änderungsrate | cm/s |
+| 13 | Head-Forward | Kopf-Vorsprung vor Hüfte | px |
+| 14 | Touché-Kandidaten | Arm gestreckt + nahe Distanz | — |
+| 15 | Rhythmus (FFT) | Dominantes Tempo im Gefecht | Hz |
+| 16 | Druck-Index | Wer treibt das Gefecht? | ± Wert |
 
 ---
 
@@ -285,6 +293,7 @@ streamlit run app.py --server.port 8502
 fencing-analyzer/
 ├── app.py                  # Streamlit-Dashboard (Hauptdatei)
 ├── worker_analyze.py       # YOLO-Analyse (Subprocess)
+├── preview_generator.py    # Annotiertes Preview-Video
 ├── report_generator.py     # PDF-Report
 ├── Dockerfile              # Container-Build (CPU + GPU)
 ├── requirements.txt        # Python-Abhängigkeiten

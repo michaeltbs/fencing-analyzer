@@ -13,6 +13,9 @@ Interactive dashboard with 15 metrics, PDF report, and live video player.
 - **15 metrics:** Distance, weapon-arm angle, lunge depth, movement path, posture, acceleration, step rhythm, reaction synchronization, heatmap, touché detection, pressure index, and more
 - **2-person tracking** — automatic, frame by frame
 - **Piste calibration** — automatic cm conversion
+- **Tracking v2:** Side-Constraint + Velocity-Interpolation + Keypoint-Smoothing
+- **Dual-Range-Slider** for precise range selection
+- **Dynamic progress bar** with time estimation
 - **PDF report** — 1 page with charts and statistics
 - **Comparison mode** — overlay two analyses
 - **Export:** JSON, CSV
@@ -223,9 +226,14 @@ docker run --gpus all -p 8501:8501 fencing-analyzer:gpu
 | 6 | Acceleration | 2nd derivative of weapon hand position | px/s² |
 | 7 | Step rhythm | Individual foot tracking (half/full) | steps/s |
 | 8 | Synchronization | Cross-correlation of hip velocities | r, Lag |
-| 9 | Heatmap | 2D histogram of piste position | density |
-| 10 | Pressure index | Who is driving the bout? | ± value |
-| 11-15 | More metrics | Touché, tempo, etc. | see UI |
+| 9 | Hand height | Shoulder-wrist height difference | px |
+| 10 | Arm extension | Shoulder-wrist distance | px |
+| 11 | Stance width | Foot-to-foot distance | px |
+| 12 | Explosiveness | Distance change rate | cm/s |
+| 13 | Head forward | Head protrusion past hips | px |
+| 14 | Touché candidates | Arm extended + close distance | — |
+| 15 | Rhythm (FFT) | Dominant fight tempo | Hz |
+| 16 | Pressure index | Who is driving the bout? | ± value |
 
 ---
 
@@ -285,6 +293,7 @@ streamlit run app.py --server.port 8502
 fencing-analyzer/
 ├── app.py                  # Streamlit dashboard (main file)
 ├── worker_analyze.py       # YOLO analysis (subprocess)
+├── preview_generator.py    # Annotated preview video
 ├── report_generator.py     # PDF report generator
 ├── Dockerfile              # Container build (CPU + GPU)
 ├── requirements.txt        # Python dependencies
