@@ -311,6 +311,27 @@ Final eval: 4/5
 
 Eval-Resultate werden in `reports/eval_<bout-id>.json` gespeichert.
 
+### Streamlit-UI mit Full-Length-Modus
+
+Ab v1.1 hat das Streamlit-Dashboard zwei Modi (Umschalter in der Sidebar):
+
+**Schnell-Clip (15-60s):** Der bisherige Modus — Clip auswählen, analysieren, sofort live im Player ansehen.
+
+**Full-Length (komplettes Gefecht):** Workflow:
+
+1. Video in der Sidebar auswählen
+2. Auf "Full-Length (komplettes Gefecht)" umschalten
+3. Im Hauptbereich auf "Konfiguration" bleiben
+4. Fechter A + B Metadaten ausfüllen (Slug, Name, Nation, Hand, Club)
+5. Bout-Daten eingeben (Turnier, Datum, Score, Waffe)
+6. Output-Optionen wählen (PDF, HD-Video, Highlights, Eval)
+7. "🚀 Full-Length-Analyse starten" klicken
+8. Live-Log zeigt Fortschritt (alle 5s aktualisiert)
+9. Nach Abschluss: "DB durchsuchen" Tab öffnen → alle gespeicherten Bouts sehen
+10. Bout auswählen → Metriken + Annotationen + Output-Dateien anzeigen
+
+Die UI startet `analyze_full.py` als Subprozess, pollt Status alle 5s, lädt nach Abschluss automatisch die Bout-Daten aus der SQLite-DB.
+
 ### Fechter-Datenbank abfragen
 
 ```python
@@ -409,6 +430,14 @@ fencing-analyzer/
 ---
 
 ## 📝 Changelog
+
+### v1.2 (Juni 2026) — Streamlit UI Full-Length Mode
+- **NEU:** `app.py` Mode-Switch (Schnell-Clip vs. Full-Length) in Sidebar
+- **NEU:** Full-Length-Konfigurations-Form (Fechter A/B, Bout-Metadaten, Output-Optionen)
+- **NEU:** Subprozess-Wrapper ruft `analyze_full.py` mit allen Flags auf
+- **NEU:** Live-Log-Fragment (5s Polling) zeigt Analyse-Fortschritt
+- **NEU:** "DB durchsuchen" Tab mit Bout-Liste, Metrik-Tabelle, Distanz-Chart, Annotationen
+- **NEU:** Output-Files-Liste (PDF, HD-Video, Highlight-Reel) mit Pfad + Größe
 
 ### v1.1 (Juni 2026) — Quality Evaluation
 - **NEU:** `subagent_eval.py` — Per-Chunk + Final Quality Evaluator
