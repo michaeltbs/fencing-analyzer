@@ -286,7 +286,30 @@ python analyze_full.py "M - T16 SCHMIDT vs TREBIS.mp4" \
 --no-highlights        Nur HD-Video, kein Highlight-Reel
 --context-s N          Sekunden Kontext um Touché (default: 5.0)
 --keep-chunks          Behält Chunk-JSON-Dateien
+--no-eval              Überspringt Subagent-Quality-Eval
 ```
+
+### Quality Evaluation
+
+Nach der Analyse bewertet ein Subagent die Qualität:
+
+- **Per-Chunk:** Frame-Coverage, Distanzverteilung, Schrittrate, Touché-Plausibilität
+- **Final:** Realistische Touché-Rate, Cross-Chunk-Konsistenz, Druck-Index-Trend
+
+Beispiel-Output:
+```
+=== Quality Evaluation ===
+Per-chunk avg score: 4.2/5 (3 chunks)
+  Chunk 1: 5/5 — looks clean
+  Chunk 2: 4/5 — moderate frame coverage 87%
+    → Check tracking continuity
+  Chunk 3: 4/5 — touch rate 6.2/min, verify in highlights
+
+Final eval: 4/5
+  → Michael dominates second half (Δ +340px)
+```
+
+Eval-Resultate werden in `reports/eval_<bout-id>.json` gespeichert.
 
 ### Fechter-Datenbank abfragen
 
@@ -369,6 +392,7 @@ fencing-analyzer/
 ├── pause_detector.py       # Motion-basierte Pausen-Erkennung (v1.0)
 ├── scheduler.py            # Chunk-Orchestrierung + DB-Persistenz (v1.0)
 ├── inference_db.py         # SQLite Fechter/Bout/Metrics Schema (v1.0)
+├── subagent_eval.py        # Quality-Eval mit Heuristik + Subagent (v1.1)
 ├── studio_export.py        # HD-Render + Highlight-Reel (v1.0)
 ├── analyze_full.py         # One-Command Full-Length Pipeline (v1.0)
 ├── preview_generator.py    # Annotiertes Preview-Video
@@ -386,13 +410,19 @@ fencing-analyzer/
 
 ## 📝 Changelog
 
+### v1.1 (Juni 2026) — Quality Evaluation
+- **NEU:** `subagent_eval.py` — Per-Chunk + Final Quality Evaluator
+- Heuristik-basierte Erkennung von Tracking-Fehlern, unrealistischen Werten
+- Subagent-Integration: Prompts für LLM-basierte Plausibilitäts-Checks
+- `analyze_full.py --no-eval` Flag zum Überspringen
+- Eval-Resultate als `reports/eval_<id>.json` persistiert
+
 ### v1.0 (Juni 2026) — Full-Length Edition
 - **NEU:** `pause_detector.py` — ffmpeg-basierte Pausen-Erkennung
 - **NEU:** `scheduler.py` — Chunked-Analyse + DB-Persistenz
 - **NEU:** `inference_db.py` — SQLite Fechter/Bout/Metrics/Annotations
 - **NEU:** `studio_export.py` — HD-Video (1080p Skelett-Overlay) + Highlight-Reel
 - **NEU:** `analyze_full.py` — One-Command-Entry-Point für komplette Gefechte
-- **NEU:** Tracking v2 Side-Constraint bleibt unverändert im `worker_analyze.py`
 - 16 Metriken + Touché-Detection laufen jetzt auch über mehrere Chunks
 - Chunked-Ausführung: Jedes aktive Segment = 1 YOLO-Subprozess
 - SQLite-Output: alle Metriken pro Frame, alle Annotationen abrufbar

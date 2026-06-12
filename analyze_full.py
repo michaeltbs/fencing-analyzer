@@ -66,6 +66,8 @@ def main():
                         help="Keep per-chunk result files")
     parser.add_argument("--context-s", type=float, default=5.0,
                         help="Seconds of context around each touché in highlights")
+    parser.add_argument("--no-eval", action="store_true",
+                        help="Skip subagent quality evaluation")
 
     args = parser.parse_args()
 
@@ -114,9 +116,16 @@ def main():
     # === Step 3: Full analysis ===
     print(f"\n[3/5] Running full-length analysis (this may take 20-30 min on GPU)...")
     t0 = time.time()
-    merged, segments = run_full_analysis(
+    use_eval = not args.no_eval
+    if use_eval:
+        print(f"  Subagent evaluation: ON (--no-eval to disable)")
+    else:
+        print(f"  Subagent evaluation: OFF")
+
+    merged, segments, eval_results = run_full_analysis(
         str(video_path), bid, db,
         keep_chunks=args.keep_chunks,
+        use_subagent_eval=use_eval,
     )
     elapsed = time.time() - t0
     if merged is None:
@@ -127,6 +136,40 @@ def main():
     print(f"  Frames: {summary.get('frames', 0)}, "
           f"Touchés: {summary.get('touches', 0)} "
           f"({summary.get('touches_high', 0)} high)")
+
+    # === Print evaluation results ===
+    if eval_results:
+        print(f"\n  === Quality Evaluation ===")
+        chunk_evals = [e for e in eval_results if e.get("type") != "final" and "error" not in e]
+        final_eval = next((e for e in eval_results if e.get("type") == "final"), None)
+        error_evals = [e for e in eval_results if "error" in e and e.get("type") != "final"]
+
+        if chunk_evals:
+            avg_score = sum(e.get("score", 0) for e in chunk_evals) / len(chunk_evals)
+            print(f"  Per-chunk avg score: {avg_score:.1f}/5 ({len(chunk_evals)} chunks)")
+            for e in chunk_evals:
+                issues_str = ", ".join(e.get("issues", [])[:2])
+                print(f"    Chunk {e['chunk_idx']+1}: {e.get('score', '?')}/5 — {issues_str[:80]}")
+                if e.get("suggestions"):
+                    print(f"      → {e['suggestions'][0][:80]}")
+
+        if final_eval:
+            print(f"\n  Final eval: {final_eval.get('score', '?')}/5")
+            for issue in final_eval.get("issues", []):
+                print(f"    ! {issue}")
+            for sug in final_eval.get("suggestions", []):
+                print(f"    → {sug}")
+
+        if error_evals:
+            print(f"\n  Eval errors: {len(error_evals)}")
+            for e in error_evals:
+                print(f"    Chunk {e.get('chunk_idx', '?')}: {e.get('error', '?')}")
+
+        # Save eval results next to merged JSON
+        eval_path = Path("reports") / f"eval_{bid[:8]}.json"
+        with open(eval_path, "w") as f:
+            json.dump(eval_results, f, indent=2, default=str)
+        print(f"\n  Eval results: {eval_path}")
 
     # Save merged JSON
     merged_path = Path("reports") / f"merged_{bid[:8]}.json"

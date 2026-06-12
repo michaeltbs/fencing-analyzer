@@ -41,6 +41,8 @@ def run_full_analysis(
     max_parallel=1,
     on_chunk_done: Optional[Callable] = None,
     on_segment_done: Optional[Callable] = None,
+    chunk_evaluator: Optional[Callable] = None,  # (idx, total, chunk_data) -> eval dict
+    final_evaluator: Optional[Callable] = None,   # (merged_result, segments) -> eval dict
     use_subagent_eval=False,
     keep_chunks=True,
     workdir=None,
@@ -55,13 +57,18 @@ def run_full_analysis(
         max_parallel: chunk-level parallelism (1 for single-GPU)
         on_chunk_done: optional callback (idx, total, result_dict)
         on_segment_done: optional callback (idx, total, segments_list)
-        use_subagent_eval: whether to call subagent evaluator (caller responsibility)
+        chunk_evaluator: optional callback (idx, total, chunk_data) -> eval dict
+                         Called after each chunk completes. Used for subagent eval.
+        final_evaluator: optional callback (merged_result, segments) -> eval dict
+                         Called once after merge. Used for final sanity check.
+        use_subagent_eval: if True and no evaluators set, default to subagent_eval module
         keep_chunks: if False, delete per-chunk result files after merging
         workdir: where to write temp chunks (default: <video_dir>/.chunks/)
 
     Returns:
         merged_result: dict with all chunk results merged
         segments: list of (type, start_s, end_s) from pause detector
+        eval_results: list of chunk eval dicts + final eval dict
     """
     video_path = Path(video_path)
     workdir = Path(workdir) if workdir else video_path.parent / CHUNKS_DIR_NAME
@@ -151,9 +158,48 @@ def run_full_analysis(
     print(f"\n  [scheduler] {len(chunk_results)}/{len(active_segments)} chunks "
           f"completed in {total_elapsed:.0f}s")
 
+    # === Per-chunk evaluation ===
+    eval_results = []
+    if chunk_results and (chunk_evaluator or use_subagent_eval):
+        evaluator = chunk_evaluator
+        if evaluator is None and use_subagent_eval:
+            from subagent_eval import SubagentEvaluator
+            evaluator = SubagentEvaluator(db=db).eval_chunk
+
+        print(f"\n  [scheduler] Running per-chunk evaluation ({len(chunk_results)} chunks)")
+        for cr in chunk_results:
+            try:
+                eval_dict = evaluator(cr["idx"], len(chunk_results), cr["data"])
+                eval_dict["chunk_idx"] = cr["idx"]
+                eval_dict["seg_start"] = cr["seg_start"]
+                eval_dict["seg_end"] = cr["seg_end"]
+                eval_results.append(eval_dict)
+                print(f"  Chunk {cr['idx']+1} eval: score={eval_dict.get('score', '?')}/5, "
+                      f"issues={len(eval_dict.get('issues', []))}")
+            except Exception as e:
+                print(f"  ! Chunk {cr['idx']} eval failed: {e}")
+                eval_results.append({"chunk_idx": cr["idx"], "error": str(e)})
+
     # === Step 4: Merge chunk results ===
     print(f"\n[3/4] Merging chunk results")
     merged = merge_chunk_results(chunk_results)
+
+    # === Final evaluation (cross-chunk sanity check) ===
+    if final_evaluator or use_subagent_eval:
+        f_eval = final_evaluator
+        if f_eval is None and use_subagent_eval:
+            from subagent_eval import SubagentEvaluator
+            f_eval = SubagentEvaluator(db=db).eval_final
+        try:
+            print(f"\n  [scheduler] Running final evaluation")
+            final_eval = f_eval(merged, segments)
+            final_eval["type"] = "final"
+            eval_results.append(final_eval)
+            print(f"  Final eval: score={final_eval.get('score', '?')}/5, "
+                  f"issues={len(final_eval.get('issues', []))}")
+        except Exception as e:
+            print(f"  ! Final eval failed: {e}")
+            eval_results.append({"type": "final", "error": str(e)})
 
     # === Step 5: Persist to DB ===
     print(f"\n[4/4] Persisting to database")
@@ -171,7 +217,7 @@ def run_full_analysis(
         except OSError:
             pass
 
-    return merged, segments
+    return merged, segments, eval_results
 
 
 def merge_chunk_results(chunk_results: List[Dict]) -> Dict:

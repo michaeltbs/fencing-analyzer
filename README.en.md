@@ -286,7 +286,30 @@ python analyze_full.py "M - T16 SCHMIDT vs TREBIS.mp4" \
 --no-highlights        HD video only, no highlight reel
 --context-s N          Seconds of context around touché (default: 5.0)
 --keep-chunks          Keep per-chunk JSON files
+--no-eval              Skip subagent quality evaluation
 ```
+
+### Quality Evaluation
+
+After analysis, a subagent evaluates the quality:
+
+- **Per-chunk:** frame coverage, distance distribution, step rate, touché plausibility
+- **Final:** realistic touché rate, cross-chunk consistency, pressure index trend
+
+Example output:
+```
+=== Quality Evaluation ===
+Per-chunk avg score: 4.2/5 (3 chunks)
+  Chunk 1: 5/5 — looks clean
+  Chunk 2: 4/5 — moderate frame coverage 87%
+    → Check tracking continuity
+  Chunk 3: 4/5 — touch rate 6.2/min, verify in highlights
+
+Final eval: 4/5
+  → Michael dominates second half (Δ +340px)
+```
+
+Eval results are saved to `reports/eval_<bout-id>.json`.
 
 ### Querying the fencer database
 
@@ -369,6 +392,7 @@ fencing-analyzer/
 ├── pause_detector.py       # Motion-based pause detection (v1.0)
 ├── scheduler.py            # Chunk orchestration + DB persistence (v1.0)
 ├── inference_db.py         # SQLite fencer/bout/metrics schema (v1.0)
+├── subagent_eval.py        # Quality eval with heuristic + subagent (v1.1)
 ├── studio_export.py        # HD render + highlight reel (v1.0)
 ├── analyze_full.py         # One-command full-length pipeline (v1.0)
 ├── preview_generator.py    # Annotated preview video
@@ -385,6 +409,13 @@ fencing-analyzer/
 ---
 
 ## 📝 Changelog
+
+### v1.1 (June 2026) — Quality Evaluation
+- **NEW:** `subagent_eval.py` — per-chunk + final quality evaluator
+- Heuristic detection of tracking errors, implausible values
+- Subagent integration: prompts for LLM-based plausibility checks
+- `analyze_full.py --no-eval` flag to skip
+- Eval results persisted to `reports/eval_<id>.json`
 
 ### v1.0 (June 2026) — Full-Length Edition
 - **NEW:** `pause_detector.py` — ffmpeg-based pause detection
