@@ -237,6 +237,78 @@ docker run --gpus all -p 8501:8501 fencing-analyzer:gpu
 
 ---
 
+## 🎬 Full-Length Analyse (NEU in v1.0)
+
+Ab v1.0 analysiert der Analyzer komplette Gefechte (15+ min) automatisch.
+Pausen werden erkannt und übersprungen, das Gefecht in aktive Segmente
+zerlegt, jedes Segment einzeln analysiert, alles in einer SQLite-Datenbank
+gespeichert — und Studio-Ready-Output (annotiertes HD-Video + Highlight-Reel)
+generiert.
+
+### Schnellstart
+
+```bash
+# Einzelner Befehl, alles automatisch
+python analyze_full.py "M - T16 SCHMIDT vs TREBIS.mp4" \
+    --fencer-a "michael-trebis" --name-a "Michael" --last-a "Trebis" \
+              --nation-a "GER" --hand-a "right" \
+    --fencer-b "richard-schmidt" --name-b "Richard" --last-b "Schmidt" \
+                --nation-b "GER" \
+    --tournament "Doha 2026" --date "2026-01-15" \
+    --score 8 15
+```
+
+**Was passiert:**
+1. **Pause-Detection** — ffmpeg-basiert, ~10s für 15 min Video
+2. **Chunked YOLO-Analyse** — jedes aktive Segment einzeln
+3. **SQLite-Persistenz** — Fechter-Stammdaten, Metriken pro Frame, Annotationen
+4. **PDF-Report** — 1-Seite mit allen Stats + Charts
+5. **Annotiertes HD-Video** — Skelett-Overlay auf 1080p
+6. **Highlight-Reel** — 5s Kontext um jeden Touché
+
+### Pipeline-Module
+
+| Datei | Zweck |
+|-------|-------|
+| `pause_detector.py` | Motion-basierte Pausen-Erkennung (ffmpeg scene detect) |
+| `scheduler.py` | Orchestriert Chunks + DB-Persistenz |
+| `worker_chunk_analyze.py` | Wrapper für `worker_analyze.py` mit Time-Offset |
+| `inference_db.py` | SQLite-Schema + CRUD für Fechter/Bouts/Metrics |
+| `studio_export.py` | HD-Render + Highlight-Reel |
+| `analyze_full.py` | One-Command-Entry-Point |
+
+### CLI-Optionen für `analyze_full.py`
+
+```
+--db PATH              SQLite-Datei (default: fencing.db)
+--no-studio            Überspringt HD/Highlight-Output
+--no-pdf               Überspringt PDF-Report
+--no-highlights        Nur HD-Video, kein Highlight-Reel
+--context-s N          Sekunden Kontext um Touché (default: 5.0)
+--keep-chunks          Behält Chunk-JSON-Dateien
+```
+
+### Fechter-Datenbank abfragen
+
+```python
+from inference_db import FencerDB
+db = FencerDB("fencing.db")
+for bout in db.list_bouts():
+    print(bout["tournament"], bout["bout_date"],
+          bout["fencer_a_score"], "vs", bout["fencer_b_score"])
+
+# Metriken abrufen
+metrics = db.get_metrics(bout["id"])
+for m in metrics[:10]:
+    print(f"t={m['t']:.1f}s  dist={m['dist_cm']}cm  angle_m={m['arm_angle_m']}")
+
+# Annotationen (Touchés, Notizen)
+for a in db.get_annotations(bout["id"], type_="touche"):
+    print(f"t={a['t']:.1f}s  {a['description']}")
+```
+
+---
+
 ## ❓ Häufige Fragen
 
 **"Die Analyse ist zu langsam!"**  
@@ -291,16 +363,48 @@ streamlit run app.py --server.port 8502
 
 ```
 fencing-analyzer/
-├── app.py                  # Streamlit-Dashboard (Hauptdatei)
+├── app.py                  # Streamlit-Dashboard (Hauptdatei, kurze Clips)
 ├── worker_analyze.py       # YOLO-Analyse (Subprocess)
+├── worker_chunk_analyze.py # Chunked Worker mit Time-Offset (v1.0)
+├── pause_detector.py       # Motion-basierte Pausen-Erkennung (v1.0)
+├── scheduler.py            # Chunk-Orchestrierung + DB-Persistenz (v1.0)
+├── inference_db.py         # SQLite Fechter/Bout/Metrics Schema (v1.0)
+├── studio_export.py        # HD-Render + Highlight-Reel (v1.0)
+├── analyze_full.py         # One-Command Full-Length Pipeline (v1.0)
 ├── preview_generator.py    # Annotiertes Preview-Video
 ├── report_generator.py     # PDF-Report
 ├── Dockerfile              # Container-Build (CPU + GPU)
 ├── requirements.txt        # Python-Abhängigkeiten
 ├── build.sh                # Auto-Build (erkennt GPU)
-├── reports/                # Generierte PDF-Reports
+├── reports/                # Generierte PDF-Reports + merged JSON
+├── studio/                 # HD-Videos + Highlight-Reels (v1.0)
+├── tests/                  # Analyse-Skripte + Motion-Profile
 └── README.md               # Diese Datei
 ```
+
+---
+
+## 📝 Changelog
+
+### v1.0 (Juni 2026) — Full-Length Edition
+- **NEU:** `pause_detector.py` — ffmpeg-basierte Pausen-Erkennung
+- **NEU:** `scheduler.py` — Chunked-Analyse + DB-Persistenz
+- **NEU:** `inference_db.py` — SQLite Fechter/Bout/Metrics/Annotations
+- **NEU:** `studio_export.py` — HD-Video (1080p Skelett-Overlay) + Highlight-Reel
+- **NEU:** `analyze_full.py` — One-Command-Entry-Point für komplette Gefechte
+- **NEU:** Tracking v2 Side-Constraint bleibt unverändert im `worker_analyze.py`
+- 16 Metriken + Touché-Detection laufen jetzt auch über mehrere Chunks
+- Chunked-Ausführung: Jedes aktive Segment = 1 YOLO-Subprozess
+- SQLite-Output: alle Metriken pro Frame, alle Annotationen abrufbar
+
+### v0.4 — Tracking v2 + UI
+- ByteTrack + Side-Constraint + VelocityInterpolator
+- 16 Metriken
+- Streamlit UI mit Live-Player
+
+### v0.3 — Initiales Release
+- YOLOv8m-Pose Integration
+- PDF-Report-Generator
 
 ---
 

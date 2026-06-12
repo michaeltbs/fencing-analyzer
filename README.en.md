@@ -232,8 +232,80 @@ docker run --gpus all -p 8501:8501 fencing-analyzer:gpu
 | 12 | Explosiveness | Distance change rate | cm/s |
 | 13 | Head forward | Head protrusion past hips | px |
 | 14 | Touché candidates | Arm extended + close distance | — |
-| 15 | Rhythm (FFT) | Dominant fight tempo | Hz |
-| 16 | Pressure index | Who is driving the bout? | ± value |
+| 15 | Rhythm (FFT) | Dominant bout tempo | Hz |
+| 16 | Pressure index | Who's driving the bout? | ± value |
+
+---
+
+## 🎬 Full-Length Analysis (NEW in v1.0)
+
+As of v1.0, the analyzer automatically processes complete bouts (15+ min).
+Pauses are detected and skipped, the bout is segmented into active phases,
+each segment is analyzed separately, everything is persisted to a SQLite
+database — and studio-ready output (annotated HD video + highlight reel)
+is generated.
+
+### Quickstart
+
+```bash
+# One command, fully automatic
+python analyze_full.py "M - T16 SCHMIDT vs TREBIS.mp4" \
+    --fencer-a "michael-trebis" --name-a "Michael" --last-a "Trebis" \
+              --nation-a "GER" --hand-a "right" \
+    --fencer-b "richard-schmidt" --name-b "Richard" --last-b "Schmidt" \
+                --nation-b "GER" \
+    --tournament "Doha 2026" --date "2026-01-15" \
+    --score 8 15
+```
+
+**What happens:**
+1. **Pause detection** — ffmpeg-based, ~10s for 15 min video
+2. **Chunked YOLO analysis** — each active segment analyzed separately
+3. **SQLite persistence** — fencer data, per-frame metrics, annotations
+4. **PDF report** — 1-page with all stats + charts
+5. **Annotated HD video** — skeleton overlay on 1080p source
+6. **Highlight reel** — 5s context around each touché
+
+### Pipeline modules
+
+| File | Purpose |
+|------|---------|
+| `pause_detector.py` | Motion-based pause detection (ffmpeg scene detect) |
+| `scheduler.py` | Orchestrates chunks + DB persistence |
+| `worker_chunk_analyze.py` | Wrapper for `worker_analyze.py` with time-offset |
+| `inference_db.py` | SQLite schema + CRUD for fencer/bout/metrics |
+| `studio_export.py` | HD render + highlight reel |
+| `analyze_full.py` | One-command entry point |
+
+### CLI options for `analyze_full.py`
+
+```
+--db PATH              SQLite file (default: fencing.db)
+--no-studio            Skip HD/highlight output
+--no-pdf               Skip PDF report
+--no-highlights        HD video only, no highlight reel
+--context-s N          Seconds of context around touché (default: 5.0)
+--keep-chunks          Keep per-chunk JSON files
+```
+
+### Querying the fencer database
+
+```python
+from inference_db import FencerDB
+db = FencerDB("fencing.db")
+for bout in db.list_bouts():
+    print(bout["tournament"], bout["bout_date"],
+          bout["fencer_a_score"], "vs", bout["fencer_b_score"])
+
+# Fetch metrics
+metrics = db.get_metrics(bout["id"])
+for m in metrics[:10]:
+    print(f"t={m['t']:.1f}s  dist={m['dist_cm']}cm  angle_m={m['arm_angle_m']}")
+
+# Annotations (touchés, notes)
+for a in db.get_annotations(bout["id"], type_="touche"):
+    print(f"t={a['t']:.1f}s  {a['description']}")
+```
 
 ---
 
@@ -287,20 +359,51 @@ streamlit run app.py --server.port 8502
 
 ---
 
-## 📁 Project Structure
+## 📁 Project structure
 
 ```
 fencing-analyzer/
-├── app.py                  # Streamlit dashboard (main file)
+├── app.py                  # Streamlit dashboard (main, short clips)
 ├── worker_analyze.py       # YOLO analysis (subprocess)
+├── worker_chunk_analyze.py # Chunked worker with time-offset (v1.0)
+├── pause_detector.py       # Motion-based pause detection (v1.0)
+├── scheduler.py            # Chunk orchestration + DB persistence (v1.0)
+├── inference_db.py         # SQLite fencer/bout/metrics schema (v1.0)
+├── studio_export.py        # HD render + highlight reel (v1.0)
+├── analyze_full.py         # One-command full-length pipeline (v1.0)
 ├── preview_generator.py    # Annotated preview video
-├── report_generator.py     # PDF report generator
+├── report_generator.py     # PDF report
 ├── Dockerfile              # Container build (CPU + GPU)
 ├── requirements.txt        # Python dependencies
 ├── build.sh                # Auto-build (detects GPU)
-├── README.md               # German README
-├── README.en.md            # English README (this file)
-└── reports/                # Generated PDF reports
+├── reports/                # Generated PDF reports + merged JSON
+├── studio/                 # HD videos + highlight reels (v1.0)
+├── tests/                  # Analysis scripts + motion profiles
+└── README.md               # This file
+```
+
+---
+
+## 📝 Changelog
+
+### v1.0 (June 2026) — Full-Length Edition
+- **NEW:** `pause_detector.py` — ffmpeg-based pause detection
+- **NEW:** `scheduler.py` — chunked analysis + DB persistence
+- **NEW:** `inference_db.py` — SQLite fencer/bout/metrics/annotations
+- **NEW:** `studio_export.py` — HD video (1080p skeleton overlay) + highlight reel
+- **NEW:** `analyze_full.py` — one-command entry point for complete bouts
+- 16 metrics + touché detection now run across multiple chunks
+- Chunked execution: each active segment = 1 YOLO subprocess
+- SQLite output: all per-frame metrics, all annotations queryable
+
+### v0.4 — Tracking v2 + UI
+- ByteTrack + Side-Constraint + VelocityInterpolator
+- 16 metrics
+- Streamlit UI with live player
+
+### v0.3 — Initial release
+- YOLOv8m-Pose integration
+- PDF report generator
 ```
 
 ---
