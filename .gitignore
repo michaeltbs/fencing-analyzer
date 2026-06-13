@@ -6,7 +6,6 @@ __pycache__/
 *.db
 reports/
 studio/
-tests/
 *.log
 .DS_Store
 venv/

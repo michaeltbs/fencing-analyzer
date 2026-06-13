@@ -1,0 +1,5 @@
+# Test dependencies — install with: pip install -r requirements-test.txt
+selenium>=4.0
+webdriver-manager>=4.0
+pytest>=8.0
+pytest-base-url>=2.0

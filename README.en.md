@@ -353,6 +353,44 @@ for a in db.get_annotations(bout["id"], type_="touche"):
 
 ---
 
+## 🧪 UI Tests (Selenium)
+
+The Streamlit UI has Selenium tests in `tests/`. They start the app in a subprocess + Chrome headless, verify DOM and capture screenshots.
+
+### Setup (one-time)
+
+```bash
+pip install -r requirements-test.txt
+```
+
+### Run tests
+
+```bash
+# all UI tests
+pytest tests/test_app_ui.py -v
+
+# single test
+pytest tests/test_app_ui.py::test_app_loads -v
+
+# with screenshot output
+pytest tests/test_app_ui.py::test_capture_screenshot -v
+```
+
+### What the tests verify
+
+- App starts without errors
+- Mode switch (Schnell-Clip / Full-Length) visible
+- Video sources (Upload / Path / YouTube) visible
+- Sidebar sections (Analyse-Modus, Video-Quelle)
+- GPU/CPU indicator
+- Screenshot capture for visual reviews
+- No console errors
+- Streamlit standard DOM (data-testid) correct
+
+Note: tests start a real Streamlit server (port 8511) and Chrome. Per-test time: 5-30s.
+
+---
+
 ## ❓ Frequently Asked Questions
 
 **"The analysis is too slow!"**  
@@ -430,6 +468,17 @@ fencing-analyzer/
 ---
 
 ## 📝 Changelog
+
+### v1.3 (June 2026) — Subagent Eval Loop + Selenium UI Tests
+- **NEW:** `eval_runner.py` — Hermes integration with `delegate_task`
+- **NEW:** Robust `SCORE:/ISSUES:/SUGGESTIONS:` parser (single-line, multi-line, mixed)
+- **NEW:** `eval_runner.py` CLI — `python eval_runner.py reports/merged_*.json`
+- **NEW:** `tests/conftest.py` + `tests/test_app_ui.py` — 11 Selenium UI tests
+- **NEW:** `requirements-test.txt` — separate test dependencies
+- **NEW:** `pytest.ini` — pytest config
+- **NEW:** Skill `fencing-pose-analysis` v2.2 with eval_runner docs
+- Tests verify: app load, mode switch, video sources, sidebar, GPU/CPU, screenshots, console errors
+- Test run: `pytest tests/test_app_ui.py -v` (~3 min, headless Chrome)
 
 ### v1.2 (June 2026) — Streamlit UI Full-Length Mode
 - **NEW:** `app.py` mode switch (Quick clip vs. Full-Length) in sidebar
