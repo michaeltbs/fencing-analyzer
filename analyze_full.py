@@ -24,10 +24,18 @@ The script is intended to run on the GPU machine. Outputs go to
 """
 import argparse
 import json
+import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -73,7 +81,7 @@ def main():
 
     video_path = Path(args.video)
     if not video_path.exists():
-        print(f"ERROR: video not found: {video_path}", file=sys.stderr)
+        logger.error(f"ERROR: video not found: {video_path}")
         sys.exit(1)
 
     from inference_db import FencerDB
@@ -84,7 +92,7 @@ def main():
     db = FencerDB(args.db)
 
     # === Step 1: Fencers ===
-    print(f"[1/5] Upserting fencers...")
+    logger.info(f"[1/5] Upserting fencers...")
     fid_a = db.upsert_fencer(
         args.fencer_a, last_name=args.last_a or args.fencer_a,
         first_name=args.name_a, nation=args.nation_a,
@@ -95,11 +103,11 @@ def main():
         first_name=args.name_b, nation=args.nation_b,
         hand=args.hand_b, club=args.club_b
     )
-    print(f"  fencer_a: {fid_a}")
-    print(f"  fencer_b: {fid_b}")
+    logger.info(f"  fencer_a: {fid_a}")
+    logger.info(f"  fencer_b: {fid_b}")
 
     # === Step 2: Bout ===
-    print(f"\n[2/5] Creating bout record...")
+    logger.info(f"\n[2/5] Creating bout record...")
     bid = db.create_bout(
         fencer_a_id=fid_a,
         fencer_b_id=fid_b,
@@ -111,16 +119,16 @@ def main():
         fencer_b_score=args.score[1] if args.score else None,
         video_path=str(video_path.resolve()),
     )
-    print(f"  bout_id: {bid}")
+    logger.info(f"  bout_id: {bid}")
 
     # === Step 3: Full analysis ===
-    print(f"\n[3/5] Running full-length analysis (this may take 20-30 min on GPU)...")
+    logger.info(f"\n[3/5] Running full-length analysis (this may take 20-30 min on GPU)...")
     t0 = time.time()
     use_eval = not args.no_eval
     if use_eval:
-        print(f"  Subagent evaluation: ON (--no-eval to disable)")
+        logger.info(f"  Subagent evaluation: ON (--no-eval to disable)")
     else:
-        print(f"  Subagent evaluation: OFF")
+        logger.info(f"  Subagent evaluation: OFF")
 
     merged, segments, eval_results = run_full_analysis(
         str(video_path), bid, db,
@@ -129,68 +137,69 @@ def main():
     )
     elapsed = time.time() - t0
     if merged is None:
-        print("ERROR: analysis produced no results", file=sys.stderr)
+        logger.error("ERROR: analysis produced no results")
         sys.exit(2)
     summary = merged.get("summary", {})
-    print(f"\n  Analysis done in {elapsed:.0f}s")
-    print(f"  Frames: {summary.get('frames', 0)}, "
-          f"Touchés: {summary.get('touches', 0)} "
-          f"({summary.get('touches_high', 0)} high)")
+    logger.info(f"\n  Analysis done in {elapsed:.0f}s")
+    logger.info("  Frames: %d, Touchés: %d (%d high)",
+                summary.get("frames", 0),
+                summary.get("touches", 0),
+                summary.get("touches_high", 0))
 
     # === Print evaluation results ===
     if eval_results:
-        print(f"\n  === Quality Evaluation ===")
+        logger.info(f"\n  === Quality Evaluation ===")
         chunk_evals = [e for e in eval_results if e.get("type") != "final" and "error" not in e]
         final_eval = next((e for e in eval_results if e.get("type") == "final"), None)
         error_evals = [e for e in eval_results if "error" in e and e.get("type") != "final"]
 
         if chunk_evals:
             avg_score = sum(e.get("score", 0) for e in chunk_evals) / len(chunk_evals)
-            print(f"  Per-chunk avg score: {avg_score:.1f}/5 ({len(chunk_evals)} chunks)")
+            logger.info(f"  Per-chunk avg score: {avg_score:.1f}/5 ({len(chunk_evals)} chunks)")
             for e in chunk_evals:
                 issues_str = ", ".join(e.get("issues", [])[:2])
-                print(f"    Chunk {e['chunk_idx']+1}: {e.get('score', '?')}/5 — {issues_str[:80]}")
+                logger.info(f"    Chunk {e['chunk_idx']+1}: {e.get('score', '?')}/5 — {issues_str[:80]}")
                 if e.get("suggestions"):
-                    print(f"      → {e['suggestions'][0][:80]}")
+                    logger.info(f"      → {e['suggestions'][0][:80]}")
 
         if final_eval:
-            print(f"\n  Final eval: {final_eval.get('score', '?')}/5")
+            logger.info(f"\n  Final eval: {final_eval.get('score', '?')}/5")
             for issue in final_eval.get("issues", []):
-                print(f"    ! {issue}")
+                logger.info(f"    ! {issue}")
             for sug in final_eval.get("suggestions", []):
-                print(f"    → {sug}")
+                logger.info(f"    → {sug}")
 
         if error_evals:
-            print(f"\n  Eval errors: {len(error_evals)}")
+            logger.info(f"\n  Eval errors: {len(error_evals)}")
             for e in error_evals:
-                print(f"    Chunk {e.get('chunk_idx', '?')}: {e.get('error', '?')}")
+                logger.info(f"    Chunk {e.get('chunk_idx', '?')}: {e.get('error', '?')}")
 
         # Save eval results next to merged JSON
         eval_path = Path("reports") / f"eval_{bid[:8]}.json"
         with open(eval_path, "w") as f:
             json.dump(eval_results, f, indent=2, default=str)
-        print(f"\n  Eval results: {eval_path}")
+        logger.info(f"\n  Eval results: {eval_path}")
 
     # Save merged JSON
     merged_path = Path("reports") / f"merged_{bid[:8]}.json"
     merged_path.parent.mkdir(parents=True, exist_ok=True)
     with open(merged_path, "w") as f:
         json.dump(merged, f, indent=2, default=str)
-    print(f"  Merged result: {merged_path}")
+    logger.info(f"  Merged result: {merged_path}")
 
     # === Step 4: PDF report ===
     if not args.no_pdf:
-        print(f"\n[4/5] Generating PDF report...")
+        logger.info(f"\n[4/5] Generating PDF report...")
         bout_name = f"{args.tournament or 'Bout'}_{args.last_a or 'A'}_vs_{args.last_b or 'B'}"
         pdf_path, preview = generate_report(merged, bout_name)
-        print(f"  PDF: {pdf_path}")
-        print(preview)
+        logger.info(f"  PDF: {pdf_path}")
+        logger.info("%s", preview)
     else:
-        print(f"\n[4/5] Skipped (--no-pdf)")
+        logger.info(f"\n[4/5] Skipped (--no-pdf)")
 
     # === Step 5: Studio outputs ===
     if not args.no_studio:
-        print(f"\n[5/5] Generating studio outputs...")
+        logger.info(f"\n[5/5] Generating studio outputs...")
         studio_dir = Path("studio")
         studio_dir.mkdir(parents=True, exist_ok=True)
         bout_name = f"{args.tournament or 'Bout'}_{args.last_a or 'A'}_vs_{args.last_b or 'B'}"
@@ -206,7 +215,7 @@ def main():
                 touches=merged.get("m14_touches", []),
             )
         except Exception as e:
-            print(f"  ! HD export failed: {e}")
+            logger.info(f"  ! HD export failed: {e}")
 
         # Highlight reel
         if not args.no_highlights and merged.get("m14_touches"):
@@ -219,15 +228,15 @@ def main():
                     context_s=args.context_s,
                 )
             except Exception as e:
-                print(f"  ! Highlights failed: {e}")
+                logger.info(f"  ! Highlights failed: {e}")
     else:
-        print(f"\n[5/5] Skipped (--no-studio)")
+        logger.info(f"\n[5/5] Skipped (--no-studio)")
 
-    print(f"\n=== DONE ===")
-    print(f"Bout ID: {bid}")
-    print(f"DB: {args.db}")
-    print(f"PDF: reports/")
-    print(f"Studio: studio/")
+    logger.info(f"\n=== DONE ===")
+    logger.info(f"Bout ID: {bid}")
+    logger.info(f"DB: {args.db}")
+    logger.info(f"PDF: reports/")
+    logger.info(f"Studio: studio/")
 
 
 if __name__ == "__main__":

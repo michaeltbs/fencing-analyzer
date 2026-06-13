@@ -13,19 +13,30 @@ Differences from worker_analyze.py:
 The output JSON is identical in schema to worker_analyze.py so existing
 downstream (player, reports) doesn't need to change.
 """
-import sys
 import json
+import logging
+import subprocess
+import sys
 import time
 import traceback
-import subprocess
 from pathlib import Path
+
+from video_utils import extract_subclip, probe_video
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python worker_chunk_analyze.py <clip_path> <result_path> "
-              "[--start-frame N] [--end-frame N] [--time-offset SECONDS]",
-              file=sys.stderr)
+        logger.error(
+            "Usage: python worker_chunk_analyze.py <clip_path> <result_path> "
+            "[--start-frame N] [--end-frame N] [--time-offset SECONDS]"
+        )
         sys.exit(1)
 
     clip_path = Path(sys.argv[1])
@@ -50,33 +61,15 @@ def main():
             i += 1
 
     # If we have a frame range, extract that subclip first using ffmpeg.
-    # The clip is needed because worker_analyze.py reads via cv2 from
-    # start to end without range support.
     work_clip = clip_path
     cleanup_clip = None
     if start_frame is not None or end_frame is not None:
-        # Probe fps for ss/t conversion
-        probe = subprocess.run([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate",
-            "-of", "default=noprint_wrappers=1", str(clip_path)
-        ], capture_output=True, text=True)
-        num, den = probe.stdout.split("=")[1].strip().split("/")
-        fps = float(num) / float(den)
-        ss = (start_frame / fps) if start_frame else 0
-        if end_frame:
-            duration = (end_frame - (start_frame or 0)) / fps
-        else:
-            duration = None  # to end
-        out = clip_path.with_suffix(f".chunk_{start_frame or 0}_{end_frame or 'end'}.mp4")
-        cmd = ["ffmpeg", "-y", "-v", "error",
-               "-ss", str(ss), "-i", str(clip_path)]
-        if duration:
-            cmd += ["-t", str(duration)]
-        cmd += ["-c", "copy", str(out)]
-        subprocess.run(cmd, check=True)
-        work_clip = out
-        cleanup_clip = out
+        out = result_path.with_suffix(
+            f".chunk_{start_frame or 0}_{end_frame or 'end'}.mp4"
+        )
+        info = probe_video(clip_path)
+        work_clip = extract_subclip(clip_path, out, start_frame, end_frame, info["fps"])
+        cleanup_clip = work_clip
 
     # Call worker_analyze.py as subprocess so chunking is fully isolated
     # (one YOLO model load per chunk, no shared state).
@@ -87,6 +80,7 @@ def main():
     proc = subprocess.run(cmd, capture_output=True, text=True)
     elapsed = time.time() - t0
     if proc.returncode != 0:
+        logger.error("worker_analyze.py failed: %s", proc.stderr)
         with open(result_path, "w") as f:
             json.dump({
                 "error": f"worker_analyze.py failed: {proc.stderr}",
@@ -108,7 +102,7 @@ def main():
         except OSError:
             pass
 
-    print(f"Chunk done in {elapsed:.1f}s -> {result_path}")
+    logger.info("Chunk done in %.1fs -> %s", elapsed, result_path)
 
 
 def _shift_times(data, offset):
@@ -135,6 +129,6 @@ def _shift_times(data, offset):
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Unhandled exception in worker_chunk_analyze")
         sys.exit(1)

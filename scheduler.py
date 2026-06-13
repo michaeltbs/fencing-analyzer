@@ -30,6 +30,11 @@ import uuid
 from pathlib import Path
 from typing import Callable, List, Dict, Optional
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 
 CHUNKS_DIR_NAME = ".chunks"
 
@@ -39,6 +44,7 @@ def run_full_analysis(
     bout_id,
     db,  # FencerDB instance
     max_parallel=1,
+    worker_script: str = "worker_chunk_analyze.py",
     on_chunk_done: Optional[Callable] = None,
     on_segment_done: Optional[Callable] = None,
     chunk_evaluator: Optional[Callable] = None,  # (idx, total, chunk_data) -> eval dict
@@ -55,6 +61,7 @@ def run_full_analysis(
         bout_id:    FencerDB bout ID
         db:         FencerDB instance
         max_parallel: chunk-level parallelism (1 for single-GPU)
+        worker_script: path to the chunk worker script (default: worker_chunk_analyze.py)
         on_chunk_done: optional callback (idx, total, result_dict)
         on_segment_done: optional callback (idx, total, segments_list)
         chunk_evaluator: optional callback (idx, total, chunk_data) -> eval dict
@@ -78,11 +85,12 @@ def run_full_analysis(
     from pause_detector import PauseDetector
 
     # === Step 1: Pause detection ===
-    print(f"\n[1/4] Pause detection on {video_path.name}")
+    logger.info(f"\n[1/4] Pause detection on {video_path.name}")
     det = PauseDetector(str(video_path), verbose=True)
     det.scan_motion(mode="fast")
     segments = det.find_bout_segments()
     det.save_profile(workdir / "motion_profile.json")
+    fps = det.fps
 
     if on_segment_done:
         on_segment_done(0, 1, segments)
@@ -90,10 +98,10 @@ def run_full_analysis(
     # === Step 2: Build chunk list ===
     active_segments = [(s, e) for typ, s, e in segments if typ == "active"]
     if not active_segments:
-        print("[scheduler] No active segments found!")
+        logger.info("[scheduler] No active segments found!")
         return None, segments
 
-    print(f"\n[2/4] {len(active_segments)} active segments to analyze")
+    logger.info(f"\n[2/4] {len(active_segments)} active segments to analyze")
 
     # === Step 3: Process each chunk ===
     chunk_results = []
@@ -102,19 +110,20 @@ def run_full_analysis(
     for chunk_idx, (seg_start, seg_end) in enumerate(active_segments):
         seg_dur = seg_end - seg_start
         result_path = workdir / f"chunk_{chunk_idx:03d}.json"
-        print(f"\n  Chunk {chunk_idx+1}/{len(active_segments)}: "
+        logger.info(f"\n  Chunk {chunk_idx+1}/{len(active_segments)}: "
               f"{seg_start:.1f}s - {seg_end:.1f}s ({seg_dur:.1f}s)")
 
         t0 = time.time()
-        # Run worker_chunk_analyze.py with time-offset
+        # Run worker_chunk_analyze.py with optional frame-range for efficiency.
+        start_frame = int(seg_start * fps)
+        end_frame = int(seg_end * fps)
         cmd = [
-            sys.executable, "worker_chunk_analyze.py",
+            sys.executable, worker_script,
             str(video_path), str(result_path),
+            "--start-frame", str(start_frame),
+            "--end-frame", str(end_frame),
             "--time-offset", str(seg_start),
         ]
-        # NOTE: We don't pass --start/--end-frame, the worker reads the
-        # whole video but we tag with offset. Future: pass start/end for
-        # efficiency once worker supports range-skip.
 
         try:
             proc = subprocess.run(
@@ -122,20 +131,20 @@ def run_full_analysis(
             )
             elapsed = time.time() - t0
             if proc.returncode != 0:
-                print(f"  ! Chunk failed: {proc.stderr[-500:]}")
+                logger.warning(f"  ! Chunk failed: {proc.stderr[-500:]}")
                 continue
 
             if not result_path.exists():
-                print(f"  ! No result file written")
+                logger.warning(f"  ! No result file written")
                 continue
 
             with open(result_path) as f:
                 chunk_data = json.load(f)
             if "error" in chunk_data:
-                print(f"  ! Chunk error: {chunk_data['error']}")
+                logger.warning(f"  ! Chunk error: {chunk_data['error']}")
                 continue
 
-            print(f"  OK ({elapsed:.0f}s, {chunk_data.get('summary',{}).get('frames', 0)} frames)")
+            logger.info(f"  OK ({elapsed:.0f}s, {chunk_data.get('summary',{}).get('frames', 0)} frames)")
             chunk_results.append({
                 "idx": chunk_idx,
                 "seg_start": seg_start,
@@ -149,13 +158,13 @@ def run_full_analysis(
                 on_chunk_done(chunk_idx, len(active_segments), chunk_data)
 
         except subprocess.TimeoutExpired:
-            print(f"  ! Chunk timeout after 30min")
+            logger.warning(f"  ! Chunk timeout after 30min")
         except Exception as e:
-            print(f"  ! Chunk exception: {e}")
+            logger.warning(f"  ! Chunk exception: {e}")
             traceback.print_exc()
 
     total_elapsed = time.time() - t_total
-    print(f"\n  [scheduler] {len(chunk_results)}/{len(active_segments)} chunks "
+    logger.info(f"\n  [scheduler] {len(chunk_results)}/{len(active_segments)} chunks "
           f"completed in {total_elapsed:.0f}s")
 
     # === Per-chunk evaluation ===
@@ -166,7 +175,7 @@ def run_full_analysis(
             from subagent_eval import SubagentEvaluator
             evaluator = SubagentEvaluator(db=db).eval_chunk
 
-        print(f"\n  [scheduler] Running per-chunk evaluation ({len(chunk_results)} chunks)")
+        logger.info(f"\n  [scheduler] Running per-chunk evaluation ({len(chunk_results)} chunks)")
         for cr in chunk_results:
             try:
                 eval_dict = evaluator(cr["idx"], len(chunk_results), cr["data"])
@@ -174,14 +183,14 @@ def run_full_analysis(
                 eval_dict["seg_start"] = cr["seg_start"]
                 eval_dict["seg_end"] = cr["seg_end"]
                 eval_results.append(eval_dict)
-                print(f"  Chunk {cr['idx']+1} eval: score={eval_dict.get('score', '?')}/5, "
+                logger.info(f"  Chunk {cr['idx']+1} eval: score={eval_dict.get('score', '?')}/5, "
                       f"issues={len(eval_dict.get('issues', []))}")
             except Exception as e:
-                print(f"  ! Chunk {cr['idx']} eval failed: {e}")
+                logger.warning(f"  ! Chunk {cr['idx']} eval failed: {e}")
                 eval_results.append({"chunk_idx": cr["idx"], "error": str(e)})
 
     # === Step 4: Merge chunk results ===
-    print(f"\n[3/4] Merging chunk results")
+    logger.info(f"\n[3/4] Merging chunk results")
     merged = merge_chunk_results(chunk_results)
 
     # === Final evaluation (cross-chunk sanity check) ===
@@ -191,18 +200,18 @@ def run_full_analysis(
             from subagent_eval import SubagentEvaluator
             f_eval = SubagentEvaluator(db=db).eval_final
         try:
-            print(f"\n  [scheduler] Running final evaluation")
+            logger.info(f"\n  [scheduler] Running final evaluation")
             final_eval = f_eval(merged, segments)
             final_eval["type"] = "final"
             eval_results.append(final_eval)
-            print(f"  Final eval: score={final_eval.get('score', '?')}/5, "
+            logger.info(f"  Final eval: score={final_eval.get('score', '?')}/5, "
                   f"issues={len(final_eval.get('issues', []))}")
         except Exception as e:
-            print(f"  ! Final eval failed: {e}")
+            logger.warning(f"  ! Final eval failed: {e}")
             eval_results.append({"type": "final", "error": str(e)})
 
     # === Step 5: Persist to DB ===
-    print(f"\n[4/4] Persisting to database")
+    logger.info(f"\n[4/4] Persisting to database")
     _persist_to_db(db, bout_id, merged, video_path)
 
     # Cleanup
@@ -469,15 +478,15 @@ def _persist_to_db(db, bout_id, merged, video_path):
         bout_id, "complete",
         completed=True,
     )
-    print(f"  [scheduler] Persisted {len(merged['frame_data'])} frames, "
+    logger.info(f"  [scheduler] Persisted {len(merged['frame_data'])} frames, "
           f"{len(annotations)} annotations")
-    print(f"  [scheduler] Stats: {dict((k, v) for k, v in s.items() if k in ('frames','touches','touches_high','dist_avg','m_angle_avg','g_angle_avg'))}")
+    logger.info(f"  [scheduler] Stats: {dict((k, v) for k, v in s.items() if k in ('frames','touches','touches_high','dist_avg','m_angle_avg','g_angle_avg'))}")
 
 
 # === CLI ===
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python scheduler.py <video_path> <bout_id> [db_path]")
+        logger.info("Usage: python scheduler.py <video_path> <bout_id> [db_path]")
         sys.exit(1)
 
     from inference_db import FencerDB
@@ -488,4 +497,4 @@ if __name__ == "__main__":
 
     db = FencerDB(db_path)
     merged, segments = run_full_analysis(video, bid, db)
-    print(f"\nFinal summary: {merged.get('summary', {})}")
+    logger.info(f"\nFinal summary: {merged.get('summary', {})}")

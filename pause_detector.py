@@ -15,12 +15,17 @@ Public API:
     det.summary()                  # human-readable overview
 """
 import json
+import logging
 import re
 import subprocess
 import time
 from pathlib import Path
 
 import numpy as np
+
+from video_utils import has_ffmpeg, probe_video
+
+logger = logging.getLogger(__name__)
 
 
 class PauseDetector:
@@ -59,6 +64,9 @@ class PauseDetector:
         """
         self._probe()
 
+        if not has_ffmpeg():
+            raise RuntimeError("ffmpeg not found — install ffmpeg and add to PATH")
+
         if mode == "fast":
             return self._scan_motion_fast()
         else:
@@ -66,20 +74,12 @@ class PauseDetector:
 
     def _probe(self):
         """Probe fps + duration via ffprobe."""
-        result = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate,duration",
-            "-of", "default=noprint_wrappers=1",
-            str(self.video_path)
-        ], capture_output=True, text=True)
-        for line in result.stdout.strip().split("\n"):
-            if "r_frame_rate" in line:
-                num, den = line.split("=")[1].split("/")
-                self.fps = float(num) / float(den)
-            elif "duration" in line:
-                self.duration_s = float(line.split("=")[1])
-        self.total_frames = int(self.duration_s * self.fps)
+        info = probe_video(self.video_path)
+        self.fps = info["fps"]
+        self.duration_s = info["duration_s"]
+        self.total_frames = info["total_frames"]
+        if self.verbose:
+            logger.info(f"Duration: {self.duration_s:.0f}s ({self.duration_s / 60:.1f} min) @ {self.fps:.0f}fps")
 
     def _scan_motion_fast(self):
         """
@@ -203,7 +203,7 @@ class PauseDetector:
 
         if self.verbose:
             elapsed = time.time() - t0
-            print(f"  [PauseDetector/fine] Done: {len(self.motion_profile)} samples in {elapsed:.1f}s")
+            logger.info(f"  [PauseDetector/fine] Done: {len(self.motion_profile)} samples in {elapsed:.1f}s")
 
         return self.motion_profile
 
@@ -319,10 +319,10 @@ class PauseDetector:
         if not self.motion_profile:
             self.scan_motion()
         segments = self.find_bout_segments()
-        print(f"=== PauseDetector Summary ===")
-        print(f"Video: {self.video_path}")
-        print(f"Duration: {self.duration_s:.0f}s ({self.duration_s / 60:.1f} min) @ {self.fps:.0f}fps")
-        print(f"Samples: {len(self.motion_profile)}")
+        logger.info(f"=== PauseDetector Summary ===")
+        logger.info(f"Video: {self.video_path}")
+        logger.info(f"Duration: {self.duration_s:.0f}s ({self.duration_s / 60:.1f} min) @ {self.fps:.0f}fps")
+        logger.info(f"Samples: {len(self.motion_profile)}")
 
         active_total = sum(s[2] - s[1] for s in segments if s[0] == "active")
         pause_total = sum(s[2] - s[1] for s in segments if s[0] == "pause")
@@ -334,17 +334,16 @@ class PauseDetector:
         print(f"Pauses: {pause_total:.0f}s ({pause_total / 60:.1f} min) "
               f"across {pause_count} segments")
 
-        print(f"\nSegments:")
+        logger.info(f"\nSegments:")
         for stype, s, e in segments:
             dur = e - s
-            print(f"  [{stype:6s}] {s:6.1f}s - {e:6.1f}s ({dur:.1f}s)")
+            logger.info(f"  [{stype:6s}] {s:6.1f}s - {e:6.1f}s ({dur:.1f}s)")
 
         if active_total > 0:
             frames_15fps = int(active_total * self.SAMPLE_FPS)
             est_seconds = int(frames_15fps * 0.2)  # ~200ms/frame YOLO
-            print(f"\nEstimated YOLO @ 15fps analysis: {frames_15fps} frames, "
-                  f"~{est_seconds}s ({est_seconds / 60:.1f} min)")
-            print(f"With chunked GPU: ~{est_seconds // 4}s ({est_seconds // 4 / 60:.1f} min)")
+            logger.info(f"\nEstimated YOLO @ 15fps analysis: {frames_15fps} frames, "                  f"~{est_seconds}s ({est_seconds / 60:.1f} min)")
+            logger.info(f"With chunked GPU: ~{est_seconds // 4}s ({est_seconds // 4 / 60:.1f} min)")
 
         return segments
 
@@ -368,7 +367,7 @@ if __name__ == "__main__":
     import sys
     video = sys.argv[1] if len(sys.argv) > 1 else None
     if not video:
-        print("Usage: python pause_detector.py <video_path>")
+        logger.info("Usage: python pause_detector.py <video_path>")
         sys.exit(1)
     det = PauseDetector(video)
     det.summary()
