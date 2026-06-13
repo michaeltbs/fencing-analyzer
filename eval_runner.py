@@ -128,43 +128,69 @@ def _parse_eval_response(text: str) -> Dict[str, Any]:
         ISSUES: <bullet>, <bullet>, ...
         SUGGESTIONS: <bullet>, ...
 
-    Falls back to: extracting any number 1-5 as score, treating entire
-    text as issues if format not found.
+    Handles:
+      - inline single-line responses (SCORE: X, ISSUES: a, SUGGESTIONS: b)
+      - multiline bullet lists
+      - missing sections (fallback: trimmed raw text as suggestion)
+      - score clamping 1-5
     """
     score = 3
     issues = []
     suggestions = []
 
-    score_match = re.search(r"SCORE:\s*(\d)", text, re.IGNORECASE)
+    # Score: first explicit SCORE, else first standalone number 1-5
+    score_match = re.search(r"SCORE:\s*(\d+)", text, re.IGNORECASE)
     if score_match:
         try:
             score = int(score_match.group(1))
         except (ValueError, IndexError):
             pass
     else:
-        # Fallback: any number 1-5
         nums = re.findall(r"\b([1-5])\b", text)
         if nums:
             score = int(nums[0])
 
-    issues = []
-    suggestions = []
-    current_section = None  # "issues" or "suggestions"
-
+    # Find ISSUES / SUGGESTIONS sections anywhere in the text.
+    # Support both single-line (comma separated) and multiline bullet lists.
+    current_section = None
     for line in text.split("\n"):
         line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
         upper = line_stripped.upper()
-        if upper.startswith("ISSUES:"):
+        if "ISSUES:" in upper:
             current_section = "issues"
-            rest = line_stripped[7:].strip()
-            if rest:
-                issues.extend(s.strip("-*• ") for s in rest.split(",") if s.strip("-*• "))
-        elif upper.startswith("SUGGESTIONS:"):
+            _, _, rest = line_stripped.partition("ISSUES:")
+            rest = rest.strip()
+            # If SUGGESTIONS also appears on same line, cut there
+            sug_pos = rest.upper().find("SUGGESTIONS:")
+            if sug_pos != -1:
+                issues_part = rest[:sug_pos].strip()
+                suggestions_part = rest[sug_pos + len("SUGGESTIONS:"):].strip()
+                if issues_part:
+                    items = [s.strip("-*• ").strip() for s in issues_part.split(",")]
+                    issues.extend(i for i in items if i)
+                if suggestions_part:
+                    items = [s.strip("-*• ").strip() for s in suggestions_part.split(",")]
+                    suggestions.extend(i for i in items if i)
+                current_section = "suggestions"
+            else:
+                if rest:
+                    items = [s.strip("-*• ").strip() for s in rest.split(",")]
+                    issues.extend(i for i in items if i)
+            continue
+
+        if "SUGGESTIONS:" in upper:
             current_section = "suggestions"
-            rest = line_stripped[12:].strip()
+            _, _, rest = line_stripped.partition("SUGGESTIONS:")
+            rest = rest.strip()
             if rest:
-                suggestions.extend(s.strip("-*• ") for s in rest.split(",") if s.strip("-*• "))
-        elif current_section == "issues" and (line_stripped.startswith("-") or line_stripped.startswith("•")):
+                items = [s.strip("-*• ").strip() for s in rest.split(",")]
+                suggestions.extend(i for i in items if i)
+            continue
+
+        if current_section == "issues" and (line_stripped.startswith("-") or line_stripped.startswith("•")):
             content = line_stripped.lstrip("-*• ").strip()
             if content:
                 issues.append(content)
@@ -173,15 +199,17 @@ def _parse_eval_response(text: str) -> Dict[str, Any]:
             if content:
                 suggestions.append(content)
 
-    # Strip empty entries
-    issues = [i for i in issues if i]
-    suggestions = [s for s in suggestions if s]
+    # Fallback: if no structured content found, use trimmed raw text as suggestion
+    if not issues and not suggestions:
+        cleaned = text.strip()
+        if cleaned:
+            suggestions.append(cleaned[:500])
 
     return {
         "score": max(1, min(5, score)),
         "issues": issues,
         "suggestions": suggestions,
-        "raw_response": text[:1000],  # cap for log readability
+        "raw_response": text[:1000],
     }
 
 

@@ -469,6 +469,22 @@ fencing-analyzer/
 
 ## 📝 Changelog
 
+### v1.3.2 (Juni 2026) — Refactoring: Logging, Effizienz, Tests
+- **NEU:** `video_utils.py` — gemeinsame ffmpeg/ffprobe Helfer (probe_video, extract_subclip, has_ffmpeg, has_ffprobe)
+- **NEU:** Frame-Range Chunking — `scheduler.py` übergibt `--start-frame`/`--end-frame`, `worker_chunk_analyze.py` extrahiert nur den Subclip
+- **NEU:** `tests/test_video_pipeline.py` + `tests/test_scheduler_integration.py` + `tests/mock_worker_chunk.py`
+- **NEU:** `tests/test_eval_runner.py` — Parser-Tests für `SCORE:/ISSUES:/SUGGESTIONS:`
+- **NEU:** `tests/test_worker_frame_range.py` — Performance-Benchmark (langsam, `--runslow`)
+- **REFACTOR:** `print()` durch `logging` ersetzt in `analyze_full.py`, `scheduler.py`, `pause_detector.py`, `worker_chunk_analyze.py`
+- **REFACTOR:** `app.py` modularisiert: `ui_media_server.py` + `ui_full_length.py` ausgelagert
+- **FIX:** `eval_runner.py` Parser handhabt inline single-line, multiline, mixed und fehlende Sektionen korrekt
+- Alle 19 Tests passing (11 UI + 6 Pipeline + 2 Scheduler Integration)
+
+### v1.3.1 (Juni 2026) — Shared Video Utils
+- **NEU:** `video_utils.py`: `probe_video`, `extract_subclip`, `has_ffmpeg`, `has_ffprobe`
+- **UPDATE:** `pause_detector.py` und `worker_chunk_analyze.py` nutzen gemeinsame Video-Helfer
+- **UPDATE:** `scheduler.py` liest fps aus `PauseDetector.fps`
+
 ### v1.3 (Juni 2026) — Subagent Eval Loop + Selenium UI Tests
 - **NEU:** `eval_runner.py` — Hermes-Integration mit `delegate_task`
 - **NEU:** Robustes `SCORE:/ISSUES:/SUGGESTIONS:` Parser (single-line, multi-line, mixed)
